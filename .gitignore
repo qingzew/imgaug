@@ -1,3 +1,7 @@
+*.py~
+*.rst~
+*.md~
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -28,6 +32,12 @@ var/
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+
+# PyCHarm
+.idea/
+
+# virtualenv
+venv/
 
 # Installer logs
 pip-log.txt
