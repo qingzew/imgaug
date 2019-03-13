@@ -2,8 +2,8 @@ from __future__ import print_function, division
 import imgaug as ia
 from imgaug import augmenters as iaa
 from imgaug import parameters as iap
-from scipy import misc
 import numpy as np
+
 
 def main():
     image = ia.quokka(size=0.5)
@@ -35,7 +35,8 @@ def main():
         iaa.CropAndPad(px=((0, 50), (0, 50), (0, 50), (0, 50)), name="pad-by-0-to-50px-each"),
         iaa.CropAndPad(percent=(0, 0.1), sample_independently=False, name="pad-by-0-to-01percent-same"),
         iaa.CropAndPad(percent=(0, 0.1), name="pad-by-0-to-01percent"),
-        iaa.CropAndPad(percent=(0, 0.1), pad_mode=ia.ALL, pad_cval=(0, 255), name="pad-by-0-to-01percent-random-pad-modes-cvals"),
+        iaa.CropAndPad(percent=(0, 0.1), pad_mode=ia.ALL, pad_cval=(0, 255),
+                       name="pad-by-0-to-01percent-random-pad-modes-cvals"),
         iaa.CropAndPad(percent=((0, 0.1), (0, 0.1), (0, 0.1), (0, 0.1)), name="pad-by-0-to-01percent-each"),
         iaa.CropAndPad(px=(-50, 0), name="crop-by-50-to-0px"),
         iaa.CropAndPad(px=((-50, 0), (-50, 0), (-50, 0), (-50, 0)), name="crop-by-50-to-0px-each"),
@@ -45,7 +46,7 @@ def main():
     ]
 
     print("original", image.shape)
-    misc.imshow(kps[0].draw_on_image(image))
+    ia.imshow(kps[0].draw_on_image(image))
 
     print("-----------------")
     print("Same aug per image")
@@ -55,7 +56,7 @@ def main():
         kps_aug = aug.augment_keypoints(kps)[0]
         img_aug_kps = kps_aug.draw_on_image(img_aug)
         print(aug.name, img_aug_kps.shape, img_aug_kps.shape[1]/img_aug_kps.shape[0])
-        misc.imshow(img_aug_kps)
+        ia.imshow(img_aug_kps)
 
     print("-----------------")
     print("Random aug per image")
@@ -68,10 +69,10 @@ def main():
             kps_aug = aug_det.augment_keypoints(kps)[0]
             img_aug_kps = kps_aug.draw_on_image(img_aug)
             img_aug_kps = np.pad(img_aug_kps, ((1, 1), (1, 1), (0, 0)), mode="constant", constant_values=255)
-            #print(aug.name, img_aug_kps.shape, img_aug_kps.shape[1]/img_aug_kps.shape[0])
             images_aug.append(img_aug_kps)
         print(aug.name)
-        misc.imshow(ia.draw_grid(images_aug))
+        ia.imshow(ia.draw_grid(images_aug))
+
 
 if __name__ == "__main__":
     main()

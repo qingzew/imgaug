@@ -5,21 +5,27 @@ Run checks via
 """
 from __future__ import print_function, division
 
+import argparse
+
+import numpy as np
+from skimage import data
+
 import imgaug as ia
 from imgaug import augmenters as iaa
-import numpy as np
-from scipy import misc
-from skimage import data
-import argparse
+
 
 def main():
     parser = argparse.ArgumentParser(description="Check augmenters visually.")
-    parser.add_argument('--only', default=None, help="If this is set, then only the results of an augmenter with this name will be shown. Optionally, comma-separated list.", required=False)
+    parser.add_argument(
+        "--only", default=None,
+        help="If this is set, then only the results of an augmenter with this name will be shown. "
+             "Optionally, comma-separated list.",
+        required=False)
     args = parser.parse_args()
 
     images = [
         ia.quokka_square(size=(128, 128)),
-        misc.imresize(data.astronaut(), (128, 128))
+        ia.imresize_single_image(data.astronaut(), (128, 128))
     ]
 
     keypoints = [
@@ -54,7 +60,6 @@ def main():
         )
     ]
 
-    # missing: InColorspace, Lambda, AssertLambda, AssertShape, Convolve
     augmenters = [
         iaa.Sequential([
             iaa.CoarseDropout(p=0.5, size_percent=0.05),
@@ -76,7 +81,7 @@ def main():
         iaa.WithChannels([0], children=[iaa.Add(20)], name="WithChannels"),
         iaa.AddToHueAndSaturation((-20, 20), per_channel=True, name="AddToHueAndSaturation"),
         iaa.Noop(name="Noop"),
-        iaa.Scale({"width": 64, "height": 64}, name="Scale"),
+        iaa.Resize({"width": 64, "height": 64}, name="Resize"),
         iaa.CropAndPad(px=(-8, 8), name="CropAndPad-px"),
         iaa.Pad(px=(0, 8), name="Pad-px"),
         iaa.Crop(px=(0, 8), name="Crop-px"),
@@ -166,18 +171,12 @@ def main():
             name="AlphaElementwiseAffine"
         ),
         iaa.SimplexNoiseAlpha(
-            #first=iaa.GaussianBlur((1.0, 3.0)),
-            #first=iaa.MedianBlur((3, 7)),
             first=iaa.EdgeDetect(1.0),
-            #first=iaa.Affine(rotate=-45), #(-45, 45)),
             per_channel=False,
             name="SimplexNoiseAlpha"
         ),
         iaa.FrequencyNoiseAlpha(
-            #first=iaa.GaussianBlur((1.0, 3.0)),
-            #first=iaa.MedianBlur((3, 7)),
             first=iaa.EdgeDetect(1.0),
-            #first=iaa.Affine(rotate=-45), #(-45, 45)),
             per_channel=False,
             name="FrequencyNoiseAlpha"
         )
@@ -198,7 +197,8 @@ def main():
                 imgs_aug_drawn = [kps_aug_one.draw_on_image(img_aug) for img_aug, kps_aug_one in zip(imgs_aug, kps_aug)]
                 imgs_aug_drawn = [bbs_aug_one.draw_on_image(img_aug) for img_aug, bbs_aug_one in zip(imgs_aug_drawn, bbs_aug)]
                 grid.append(np.hstack(imgs_aug_drawn))
-            misc.imshow(np.vstack(grid))
+            ia.imshow(np.vstack(grid))
+
 
 if __name__ == "__main__":
     main()

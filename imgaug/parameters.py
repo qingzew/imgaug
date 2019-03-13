@@ -1,142 +1,221 @@
 from __future__ import print_function, division, absolute_import
-from . import imgaug as ia
-from .external.opensimplex import OpenSimplex
-from abc import ABCMeta, abstractmethod
-import numpy as np
 import copy as copy_module
+from collections import defaultdict
+from abc import ABCMeta, abstractmethod
+import tempfile
+
+import numpy as np
 import six
 import six.moves as sm
 import scipy
-import numbers
-from collections import defaultdict
-from scipy import misc
+import scipy.stats
+import imageio
 
-NP_FLOAT_TYPES = set(np.sctypes["float"])
+from . import imgaug as ia
+from . import dtypes as iadt
+from .external.opensimplex import OpenSimplex
 
-def handle_continuous_param(param, name, value_range=None, tuple_to_uniform=True, list_to_choice=True):
-    def check_value_range(v):
-        if value_range is None:
+
+def _check_value_range(v, name, value_range):
+    if value_range is None:
+        return True
+    elif isinstance(value_range, tuple):
+        ia.do_assert(len(value_range) == 2)
+        if value_range[0] is None and value_range[1] is None:
             return True
-        elif isinstance(value_range, tuple):
-            ia.do_assert(len(value_range) == 2)
-            if value_range[0] is None and value_range[1] is None:
-                return True
-            elif value_range[0] is None:
-                ia.do_assert(v <= value_range[1], "Parameter '%s' is outside of the expected value range (x <= %.4f)" % (name, value_range[1]))
-                return True
-            elif value_range[1] is None:
-                ia.do_assert(value_range[0] <= v, "Parameter '%s' is outside of the expected value range (%.4f <= x)" % (name, value_range[0]))
-                return True
-            else:
-                ia.do_assert(value_range[0] <= v <= value_range[1], "Parameter '%s' is outside of the expected value range (%.4f <= x <= %.4f)" % (name, value_range[0], value_range[1]))
-                return True
-        elif ia.is_callable(value_range):
-            value_range(v)
+        elif value_range[0] is None:
+            ia.do_assert(
+                v <= value_range[1],
+                "Parameter '%s' is outside of the expected value range (x <= %.4f)" % (name, value_range[1]))
+            return True
+        elif value_range[1] is None:
+            ia.do_assert(
+                value_range[0] <= v,
+                "Parameter '%s' is outside of the expected value range (%.4f <= x)" % (name, value_range[0]))
             return True
         else:
-            raise Exception("Unexpected input for value_range, got %s." % (str(value_range),))
+            ia.do_assert(
+                value_range[0] <= v <= value_range[1],
+                "Parameter '%s' is outside of the expected value range (%.4f <= x <= %.4f)" % (
+                    name, value_range[0], value_range[1]))
+            return True
+    elif ia.is_callable(value_range):
+        value_range(v)
+        return True
+    else:
+        raise Exception("Unexpected input for value_range, got %s." % (str(value_range),))
 
+
+def handle_continuous_param(param, name, value_range=None, tuple_to_uniform=True, list_to_choice=True):
     if ia.is_single_number(param):
-        check_value_range(param)
+        _check_value_range(param, name, value_range)
         return Deterministic(param)
     elif tuple_to_uniform and isinstance(param, tuple):
-        ia.do_assert(len(param) == 2)
-        check_value_range(param[0])
-        check_value_range(param[1])
+        ia.do_assert(
+            len(param) == 2,
+            "Expected parameter '%s' with type tuple to have exactly two entries, but got %d." % (name, len(param)))
+        ia.do_assert(
+            all([ia.is_single_number(v) for v in param]),
+            "Expected parameter '%s' with type tuple to only contain numbers, got %s." % (
+                name, [type(v) for v in param],))
+        _check_value_range(param[0], name, value_range)
+        _check_value_range(param[1], name, value_range)
         return Uniform(param[0], param[1])
-    elif list_to_choice and ia.is_iterable(param):
+    elif list_to_choice and ia.is_iterable(param) and not isinstance(param, tuple):
+        ia.do_assert(
+            all([ia.is_single_number(v) for v in param]),
+            "Expected iterable parameter '%s' to only contain numbers, got %s." % (
+                name, [type(v) for v in param],))
         for param_i in param:
-            check_value_range(param_i)
+            _check_value_range(param_i, name, value_range)
         return Choice(param)
     elif isinstance(param, StochasticParameter):
         return param
     else:
-        raise Exception("Expected number, tuple of two number, list of number or StochasticParameter for %s, got %s." % (name, type(param),))
+        allowed_type = "number"
+        list_str = ", list of %s" % (allowed_type,) if list_to_choice else ""
+        raise Exception("Expected %s, tuple of two %s%s or StochasticParameter for %s, got %s." % (
+            allowed_type, allowed_type, list_str, name, type(param),))
+
 
 def handle_discrete_param(param, name, value_range=None, tuple_to_uniform=True, list_to_choice=True, allow_floats=True):
-    def check_value_range(v):
-        if value_range is None:
-            return True
-        elif isinstance(value_range, tuple):
-            ia.do_assert(len(value_range) == 2)
-            if value_range[0] is None and value_range[1] is None:
-                return True
-            elif value_range[0] is None:
-                ia.do_assert(v <= value_range[1], "Parameter '%s' is outside of the expected value range (x <= %.4f)" % (name, value_range[1]))
-                return True
-            elif value_range[1] is None:
-                ia.do_assert(value_range[0] <= v, "Parameter '%s' is outside of the expected value range (%.4f <= x)" % (name, value_range[0]))
-                return True
-            else:
-                ia.do_assert(value_range[0] <= v <= value_range[1], "Parameter '%s' is outside of the expected value range (%.4f <= x <= %.4f)" % (name, value_range[0], value_range[1]))
-                return True
-        elif ia.is_callable(value_range):
-            value_range(v)
-            return True
-        else:
-            raise Exception("Unexpected input for value_range, got %s." % (str(value_range),))
-
     if ia.is_single_integer(param) or (allow_floats and ia.is_single_float(param)):
-        check_value_range(param)
+        _check_value_range(param, name, value_range)
         return Deterministic(int(param))
     elif tuple_to_uniform and isinstance(param, tuple):
         ia.do_assert(len(param) == 2)
-        if allow_floats:
-            ia.do_assert(ia.is_single_number(param[0]), "Expected number, got %s." % (type(param[0]),))
-            ia.do_assert(ia.is_single_number(param[1]), "Expected number, got %s." % (type(param[1]),))
-        else:
-            ia.do_assert(ia.is_single_integer(param[0]), "Expected integer, got %s." % (type(param[0]),))
-            ia.do_assert(ia.is_single_integer(param[1]), "Expected integer, got %s." % (type(param[1]),))
-        check_value_range(param[0])
-        check_value_range(param[1])
+        ia.do_assert(
+            all([ia.is_single_number(v) if allow_floats else ia.is_single_integer(v) for v in param]),
+            "Expected parameter '%s' of type tuple to only contain %s, got %s." % (
+                name, "number" if allow_floats else "integer", [type(v) for v in param],))
+        _check_value_range(param[0], name, value_range)
+        _check_value_range(param[1], name, value_range)
         return DiscreteUniform(int(param[0]), int(param[1]))
-    elif list_to_choice and ia.is_iterable(param):
+    elif list_to_choice and ia.is_iterable(param) and not isinstance(param, tuple):
+        ia.do_assert(
+            all([ia.is_single_number(v) if allow_floats else ia.is_single_integer(v) for v in param]),
+            "Expected iterable parameter '%s' to only contain %s, got %s." % (
+                name, "number" if allow_floats else "integer", [type(v) for v in param],))
+
         for param_i in param:
-            check_value_range(param_i)
+            _check_value_range(param_i, name, value_range)
         return Choice([int(param_i) for param_i in param])
     elif isinstance(param, StochasticParameter):
         return param
     else:
-        if allow_floats:
-            raise Exception("Expected number, tuple of two number, list of number or StochasticParameter for %s, got %s." % (name, type(param),))
+        allowed_type = "number" if allow_floats else "int"
+        list_str = ", list of %s" % (allowed_type,) if list_to_choice else ""
+        raise Exception(
+            "Expected %s, tuple of two %s%s or StochasticParameter for %s, got %s." % (
+                allowed_type, allowed_type, list_str, name, type(param),))
+
+
+def handle_discrete_kernel_size_param(param, name, value_range=(1, None), allow_floats=True):
+    if ia.is_single_integer(param) or (allow_floats and ia.is_single_float(param)):
+        _check_value_range(param, name, value_range)
+        return Deterministic(int(param)), None
+    elif isinstance(param, tuple):
+        ia.do_assert(len(param) == 2)
+        if all([ia.is_single_integer(param_i) for param_i in param]) \
+                or (allow_floats and all([ia.is_single_float(param_i) for param_i in param])):
+            _check_value_range(param[0], name, value_range)
+            _check_value_range(param[1], name, value_range)
+            return DiscreteUniform(int(param[0]), int(param[1])), None
+        elif all([isinstance(param_i, StochasticParameter) for param_i in param]):
+            return param[0], param[1]
         else:
-            raise Exception("Expected int, tuple of two int, list of int or StochasticParameter for %s, got %s." % (name, type(param),))
+            handled = (
+                handle_discrete_param(param[0], "%s[0]" % (name,), value_range, allow_floats=allow_floats),
+                handle_discrete_param(param[1], "%s[1]" % (name,), value_range, allow_floats=allow_floats)
+            )
+
+            return handled
+    elif ia.is_iterable(param) and not isinstance(param, tuple):
+        ia.do_assert(
+            all([ia.is_single_number(v) if allow_floats else ia.is_single_integer(v) for v in param]),
+            "Expected iterable parameter '%s' to only contain %s, got %s." % (
+                name, "number" if allow_floats else "integer", [type(v) for v in param],))
+
+        for param_i in param:
+            _check_value_range(param_i, name, value_range)
+        return Choice([int(param_i) for param_i in param]), None
+    elif isinstance(param, StochasticParameter):
+        return param, None
+    else:
+        raise Exception("Expected int, tuple/list with 2 entries or StochasticParameter. Got %s." % (type(param),))
+
+
+def handle_probability_param(param, name, tuple_to_uniform=False, list_to_choice=False):
+    eps = 1e-6
+    if param in [True, False, 0, 1]:
+        return Deterministic(int(param))
+    elif ia.is_single_number(param):
+        ia.do_assert(0.0 <= param <= 1.0)
+        if 0.0-eps < param < 0.0+eps or 1.0-eps < param < 1.0+eps:
+            return Deterministic(int(np.round(param)))
+        else:
+            return Binomial(param)
+    elif tuple_to_uniform and isinstance(param, tuple):
+        ia.do_assert(
+            all([ia.is_single_number(v) for v in param]),
+            "Expected parameter '%s' of type tuple to only contain number, got %s." % (
+                name, [type(v) for v in param],))
+        ia.do_assert(len(param) == 2)
+        ia.do_assert(0 <= param[0] <= 1.0)
+        ia.do_assert(0 <= param[1] <= 1.0)
+        return Binomial(Uniform(param[0], param[1]))
+    elif list_to_choice and ia.is_iterable(param):
+        ia.do_assert(
+            all([ia.is_single_number(v) for v in param]),
+            "Expected iterable parameter '%s' to only contain number, got %s." % (
+                name, [type(v) for v in param],))
+        ia.do_assert(all([0 <= p_i <= 1.0 for p_i in param]))
+        return Binomial(Choice(param))
+    elif isinstance(param, StochasticParameter):
+        return param
+    else:
+        raise Exception("Expected boolean or number or StochasticParameter for %s, got %s." % (name, type(param),))
+
 
 def force_np_float_dtype(val):
-    if val.dtype in NP_FLOAT_TYPES:
+    if val.dtype.kind == "f":
         return val
-    else:
-        return val.astype(np.float32)
+    return val.astype(np.float64)
+
 
 def both_np_float_if_one_is_float(a, b):
-    a_f = a.dtype in NP_FLOAT_TYPES
-    b_f = b.dtype in NP_FLOAT_TYPES
+    a_f = a.dtype.type in ia.NP_FLOAT_TYPES
+    b_f = b.dtype.type in ia.NP_FLOAT_TYPES
     if a_f and b_f:
         return a, b
     elif a_f:
-        return a, b.astype(np.float32)
+        return a, b.astype(np.float64)
     elif b_f:
-        return a.astype(np.float32), b
+        return a.astype(np.float64), b
     else:
-        return a.astype(np.float32), b.astype(np.float32)
+        return a.astype(np.float64), b.astype(np.float64)
+
 
 def draw_distributions_grid(params, rows=None, cols=None, graph_sizes=(350, 350), sample_sizes=None, titles=None):
     if titles is None:
         titles = [None] * len(params)
-    elif titles == False:
+    elif titles is False:
         titles = [False] * len(params)
 
     if sample_sizes is not None:
-        images = [param_i.draw_distribution_graph(size=size_i, title=title_i) for param_i, size_i, title_i in zip(params, sample_sizes, titles)]
+        images = [param_i.draw_distribution_graph(size=size_i, title=title_i)
+                  for param_i, size_i, title_i in zip(params, sample_sizes, titles)]
     else:
-        images = [param_i.draw_distribution_graph(title=title_i) for param_i, title_i in zip(params, titles)]
+        images = [param_i.draw_distribution_graph(title=title_i)
+                  for param_i, title_i in zip(params, titles)]
 
-    images_rs = ia.imresize_many_images(np.array(images), sizes=graph_sizes)
+    images_rs = ia.imresize_many_images(images, sizes=graph_sizes)
     grid = ia.draw_grid(images_rs, rows=rows, cols=cols)
     return grid
 
+
 def show_distributions_grid(params, rows=None, cols=None, graph_sizes=(350, 350), sample_sizes=None, titles=None):
-    misc.imshow(
+    ia.imshow(
         draw_distributions_grid(
             params,
             graph_sizes=graph_sizes,
@@ -146,6 +225,7 @@ def show_distributions_grid(params, rows=None, cols=None, graph_sizes=(350, 350)
             titles=titles
         )
     )
+
 
 @six.add_metaclass(ABCMeta)
 class StochasticParameter(object): # pylint: disable=locally-disabled, unused-variable, line-too-long
@@ -168,13 +248,13 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
 
         Parameters
         ----------
-        random_state : None or np.random.RandomState, optional(default=None)
+        random_state : None or numpy.random.RandomState, optional
             A random state to use during the sampling process.
             If None, the libraries global random state will be used.
 
         Returns
         -------
-        out : anything
+        any
             A single sample value.
 
         """
@@ -186,23 +266,26 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
 
         Parameters
         ----------
-        size : tuple of int
-            Number of sample values by
-            dimension.
+        size : tuple of int or int
+            Number of sample values by dimension.
 
-        random_state : None or np.random.RandomState, optional(default=None)
+        random_state : None or np.random.RandomState, optional
             A random state to use during the sampling process.
             If None, the libraries global random state will be used.
 
         Returns
         -------
-        out : (size) iterable
+        samples : iterable
             Sampled values. Usually a numpy ndarray of basically any dtype,
-            though not strictly limited to numpy arrays.
+            though not strictly limited to numpy arrays. Its shape is expected to
+            match `size`.
 
         """
+        # TODO convert int to random state here
         random_state = random_state if random_state is not None else ia.current_random_state()
-        samples = self._draw_samples(size, random_state)
+        samples = self._draw_samples(
+            size if not ia.is_single_integer(size) else tuple([size]),
+            random_state)
         ia.forward_random_state(random_state)
 
         return samples
@@ -215,19 +298,22 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Add(self, other)
         else:
-            raise Exception("Invalid datatypes in: StochasticParameter + %s. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: StochasticParameter + %s. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __sub__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Subtract(self, other)
         else:
-            raise Exception("Invalid datatypes in: StochasticParameter - %s. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: StochasticParameter - %s. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __mul__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Multiply(self, other)
         else:
-            raise Exception("Invalid datatypes in: StochasticParameter * %s. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: StochasticParameter * %s. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __pow__(self, other, z=None):
         if z is not None:
@@ -235,37 +321,50 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Power(self, other)
         else:
-            raise Exception("Invalid datatypes in: StochasticParameter ** %s. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: StochasticParameter ** %s. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __div__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Divide(self, other)
         else:
-            raise Exception("Invalid datatypes in: StochasticParameter / %s. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: StochasticParameter / %s. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __truediv__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Divide(self, other)
         else:
-            raise Exception("Invalid datatypes in: StochasticParameter / %s (truediv). Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: StochasticParameter / %s (truediv). "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
+
+    def __floordiv__(self, other):
+        if ia.is_single_number(other) or isinstance(other, StochasticParameter):
+            return Discretize(Divide(self, other))
+        else:
+            raise Exception(("Invalid datatypes in: StochasticParameter // %s (floordiv). "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __radd__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Add(other, self)
         else:
-            raise Exception("Invalid datatypes in: %s + StochasticParameter. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: %s + StochasticParameter. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __rsub__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Subtract(other, self)
         else:
-            raise Exception("Invalid datatypes in: %s - StochasticParameter. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: %s - StochasticParameter. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __rmul__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Multiply(other, self)
         else:
-            raise Exception("Invalid datatypes in: %s * StochasticParameter. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: %s * StochasticParameter. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __rpow__(self, other, z=None):
         if z is not None:
@@ -273,19 +372,29 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Power(other, self)
         else:
-            raise Exception("Invalid datatypes in: %s ** StochasticParameter. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: %s ** StochasticParameter. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __rdiv__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Divide(other, self)
         else:
-            raise Exception("Invalid datatypes in: %s / StochasticParameter. Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: %s / StochasticParameter. "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def __rtruediv__(self, other):
         if ia.is_single_number(other) or isinstance(other, StochasticParameter):
             return Divide(other, self)
         else:
-            raise Exception("Invalid datatypes in: %s / StochasticParameter (truediv). Expected second argument to be number or StochasticParameter." % (type(other),))
+            raise Exception(("Invalid datatypes in: %s / StochasticParameter (rtruediv). "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
+
+    def __rfloordiv__(self, other):
+        if ia.is_single_number(other) or isinstance(other, StochasticParameter):
+            return Discretize(Divide(other, self))
+        else:
+            raise Exception(("Invalid datatypes in: StochasticParameter // %s (rfloordiv). "
+                             + "Expected second argument to be number or StochasticParameter.") % (type(other),))
 
     def copy(self):
         """
@@ -293,7 +402,7 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
 
         Returns
         -------
-        out : StochasticParameter
+        imgaug.parameters.StochasticParameter
             Shallow copy.
 
         """
@@ -305,7 +414,7 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
 
         Returns
         -------
-        out : StochasticParameter
+        imgaug.parameters.StochasticParameter
             Deep copy.
 
         """
@@ -318,18 +427,18 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
 
         Parameters
         ----------
-        title : None or False or string, optional(default=None)
+        title : None or False or str, optional
             Title of the plot. None is automatically replaced by a title
-            derived from `str(param)`. If set to False, no title will be
+            derived from ``str(param)``. If set to False, no title will be
             shown.
 
         size : tuple of int
             Number of points to sample. This is always expected to have at
             least two values. The first defines the number of sampling runs,
             the second (and further) dimensions define the size assigned
-            to each `draw_samples()` call. E.g. `(10, 20, 15)` will lead
-            to `10` calls of `draw_samples(size=(20, 15))`. The results
-            will be merged to a single 1d array.
+            to each :func:`imgaug.parameters.StochasticParameter.draw_samples`
+            call. E.g. ``(10, 20, 15)`` will lead to ``10`` calls of
+            ``draw_samples(size=(20, 15))``. The results will be merged to a single 1d array.
 
         bins : int
             Number of bins in the plot histograms.
@@ -340,6 +449,7 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
             Image of the plot.
 
         """
+        # import only when necessary (faster startup; optional dependency; less fragile -- see issue #225)
         import matplotlib.pyplot as plt
 
         points = []
@@ -352,77 +462,73 @@ class StochasticParameter(object): # pylint: disable=locally-disabled, unused-va
         ax = fig.gca()
         heights, bins = np.histogram(points, bins=bins)
         heights = heights / sum(heights)
-        ax.bar(
-            bins[:-1],
-            heights,
-            width=(max(bins) - min(bins))/len(bins),
-            color="blue",
-            alpha=0.75
-        )
-        #print("[draw_distribution_graph] points", points[0:100])
-        #print("[draw_distribution_graph] min/max/avg", np.min(points), np.max(points), np.average(points))
-        #print("[draw_distribution_graph] bins", len(bins), bins[0:10], heights[0:10])
+        ax.bar(bins[:-1], heights, width=(max(bins) - min(bins))/len(bins), color="blue", alpha=0.75)
 
         if title is None:
             title = str(self)
-        if title != False:
+        if title is not False:
             # split long titles - otherwise matplotlib generates errors
             title_fragments = [title[i:i+50] for i in sm.xrange(0, len(title), 50)]
             ax.set_title("\n".join(title_fragments))
         fig.tight_layout(pad=0)
-        fig.canvas.draw()
-        data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+        with tempfile.NamedTemporaryFile(suffix=".png") as f:
+            # we don't add bbox_inches='tight' here so that draw_distributions_grid has an easier
+            # time combining many plots
+            fig.savefig(f.name)
+            data = imageio.imread(f)[..., 0:3]
+
         plt.close()
+
         return data
 
-class Binomial(StochasticParameter):
+
+class Deterministic(StochasticParameter):
     """
-    Binomial distribution.
+    Parameter that is a constant value.
+
+    If ``N`` values are sampled from this parameter, it will return ``N`` times
+    ``V``, where ``V`` is the constant value.
 
     Parameters
     ----------
-    p : number or tuple of two number or list of number or StochasticParameter
-        Probability of the binomial distribution. Expected to be in the
-        range [0, 1]. If this is a StochasticParameter, the value will be
-        sampled once per call to _draw_samples().
+    value : number or str or imgaug.parameters.StochasticParameter
+        A constant value to use.
+        A string may be provided to generate arrays of strings.
+        If this is a StochasticParameter, a single value will be sampled
+        from it exactly once and then used as the constant value.
 
     Examples
     --------
-    >>> param = Binomial(Uniform(0.01, 0.2))
+    >>> param = Deterministic(10)
 
-    Uses a varying probability `p` between 0.01 and 0.2 per sampling.
+    Will always sample the value 10.
 
     """
+    def __init__(self, value):
+        super(Deterministic, self).__init__()
 
-    def __init__(self, p):
-        super(Binomial, self).__init__()
-
-        """
-        if isinstance(p, StochasticParameter):
-            self.p = p
-        elif ia.is_single_number(p):
-            ia.do_assert(0 <= p <= 1.0, "Expected probability p to be in range [0.0, 1.0], got %s." % (p,))
-            self.p = Deterministic(float(p))
+        if isinstance(value, StochasticParameter):
+            self.value = value.draw_sample()
+        elif ia.is_single_number(value) or ia.is_string(value):
+            self.value = value
         else:
-            raise Exception("Expected StochasticParameter or float/int value, got %s." % (type(p),))
-        """
-
-        self.p = handle_continuous_param(p, "p")
+            raise Exception("Expected StochasticParameter object or number or string, got %s." % (type(value),))
 
     def _draw_samples(self, size, random_state):
-        p = self.p.draw_sample(random_state=random_state)
-        ia.do_assert(0 <= p <= 1.0, "Expected probability p to be in range [0.0, 1.0], got %s." % (p,))
-        return random_state.binomial(1, p, size)
+        return np.full(size, self.value)
 
     def __repr__(self):
         return self.__str__()
 
     def __str__(self):
-        if isinstance(self.p, float):
-            return "Binomial(%.4f)" % (self.p,)
+        if ia.is_single_integer(self.value):
+            return "Deterministic(int %d)" % (self.value,)
+        elif ia.is_single_float(self.value):
+            return "Deterministic(float %.8f)" % (self.value,)
         else:
-            return "Binomial(%s)" % (self.p,)
+            return "Deterministic(%s)" % (str(self.value),)
+
 
 class Choice(StochasticParameter):
     """
@@ -434,11 +540,10 @@ class Choice(StochasticParameter):
         List of allowed values.
         Usually expected to be integers, floats or strings.
 
-    replace : bool, optional(default=True)
-        Whether to perform sampling with or without
-        replacing.
+    replace : bool, optional
+        Whether to perform sampling with or without replacing.
 
-    p : None or iterable, optional(default=None)
+    p : None or iterable of number, optional
         Optional probabilities of each element in `a`.
         Must have the same length as `a` (if provided).
 
@@ -453,36 +558,38 @@ class Choice(StochasticParameter):
     def __init__(self, a, replace=True, p=None):
         super(Choice, self).__init__()
 
+        ia.do_assert(ia.is_iterable(a), "Expected a to be an iterable (e.g. list), got %s." % (type(a),))
         self.a = a
         self.replace = replace
+        if p is not None:
+            ia.do_assert(ia.is_iterable(p), "Expected p to be None or an iterable, got %s." % (type(p),))
+            ia.do_assert(len(p) == len(a),
+                         "Expected lengths of a and p to be identical, got %d and %d." % (len(a), len(p)))
         self.p = p
 
     def _draw_samples(self, size, random_state):
         if any([isinstance(a_i, StochasticParameter) for a_i in self.a]):
+            # TODO replace by derive_random_state()
             seed = random_state.randint(0, 10**6, 1)[0]
             samples = ia.new_random_state(seed).choice(self.a, np.prod(size), replace=self.replace, p=self.p)
 
             # collect the sampled parameters and how many samples must be taken
             # from each of them
             params_counter = defaultdict(lambda: 0)
-            #params_keys = set()
             for sample in samples:
                 if isinstance(sample, StochasticParameter):
                     key = str(sample)
                     params_counter[key] += 1
-                    #params_keys.add(key)
 
             # collect per parameter once the required number of samples
             # iterate here over self.a to always use the same seed for
             # the same parameter
-            # TODO this might fail if the same parameter is added
-            # multiple times to self.a?
+            # TODO this might fail if the same parameter is added multiple times to self.a?
             # TODO this will fail if a parameter cant handle size=(N,)
             param_to_samples = dict()
             for i, param in enumerate(self.a):
                 key = str(param)
                 if key in params_counter:
-                    #print("[Choice] sampling %d from %s" % (params_counter[key], key))
                     param_to_samples[key] = param.draw_samples(
                         size=(params_counter[key],),
                         random_state=ia.new_random_state(seed+1+i)
@@ -492,13 +599,9 @@ class Choice(StochasticParameter):
             # array by replacing the respective parameter
             param_to_readcount = defaultdict(lambda: 0)
             for i, sample in enumerate(samples):
-                #if i%10 == 0:
-                #    print("[Choice] assigning sample %d" % (i,))
                 if isinstance(sample, StochasticParameter):
                     key = str(sample)
                     readcount = param_to_readcount[key]
-                    #if readcount%10==0:
-                    #    print("[Choice] readcount %d for %s" % (readcount, key))
                     samples[i] = param_to_samples[key][readcount]
                     param_to_readcount[key] += 1
 
@@ -513,46 +616,76 @@ class Choice(StochasticParameter):
     def __str__(self):
         return "Choice(a=%s, replace=%s, p=%s)" % (str(self.a), str(self.replace), str(self.p),)
 
+
+class Binomial(StochasticParameter):
+    """
+    Binomial distribution.
+
+    Parameters
+    ----------
+    p : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Probability of the binomial distribution. Expected to be in the
+        range [0, 1].
+
+            * If this is a number, then that number will always be used as the probability.
+            * If this is a tuple (a, b), a random value will be sampled from the range a<=x<b per call
+              to :func:`imgaug.parameters.Binomial._draw_samples`.
+            * If this is a list of numbers, a random value will be picked from that list per call.
+            * If this is a StochasticParameter, the value will be sampled once per call.
+
+    Examples
+    --------
+    >>> param = Binomial(Uniform(0.01, 0.2))
+
+    Uses a varying probability `p` between 0.01 and 0.2 per sampling.
+
+    """
+
+    def __init__(self, p):
+        super(Binomial, self).__init__()
+        self.p = handle_continuous_param(p, "p")
+
+    def _draw_samples(self, size, random_state):
+        p = self.p.draw_sample(random_state=random_state)
+        ia.do_assert(0 <= p <= 1.0, "Expected probability p to be in range [0.0, 1.0], got %s." % (p,))
+        return random_state.binomial(1, p, size)
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        return "Binomial(%s)" % (self.p,)
+
+
 class DiscreteUniform(StochasticParameter):
     """
     Parameter that resembles a discrete range of values [a .. b].
 
     Parameters
     ----------
-    {a, b} : int or StochasticParameter
-        Lower and upper bound of the sampling range. Values will be sampled
-        from a <= x <= b. All sampled values will be discrete. If a or b is
-        a StochasticParameter, it will be queried once per sampling to
-        estimate the value of a/b. If a>b, the values will automatically be
-        flipped. If a==b, all generated values will be identical to a.
+    a : int or imgaug.parameters.StochasticParameter
+        Lower bound of the sampling range. Values will be sampled from ``a<=x<=b``. All sampled values will be
+        discrete. If `a` is a StochasticParameter, it will be queried once per sampling to estimate the value
+        of `a`. If ``a>b``, the values will automatically be flipped. If ``a==b``, all generated values will be
+        identical to a.
+
+    b : int or imgaug.parameters.StochasticParameter
+        Upper bound of the sampling range. Values will be sampled from ``a<=x<=b``. All sampled values will be
+        discrete. If `b` is a StochasticParameter, it will be queried once per sampling to estimate the value
+        of `b`. If ``a>b``, the values will automatically be flipped. If ``a==b``, all generated values will be
+        identical to a.
 
     Examples
     --------
     >>> param = DiscreteUniform(10, Choice([20, 30, 40]))
 
-    Sampled values will be discrete and come from the either [10..20] or
-    [10..30] or [10..40].
+    Sampled values will be discrete and come from the either [10..20] or [10..30] or [10..40].
 
     """
 
     def __init__(self, a, b):
         super(DiscreteUniform, self).__init__()
 
-        """
-        # for two ints the samples will be from range a <= x <= b
-        ia.do_assert(isinstance(a, (int, StochasticParameter)), "Expected a to be int or StochasticParameter, got %s" % (type(a),))
-        ia.do_assert(isinstance(b, (int, StochasticParameter)), "Expected b to be int or StochasticParameter, got %s" % (type(b),))
-
-        if ia.is_single_integer(a):
-            self.a = Deterministic(a)
-        else:
-            self.a = a
-
-        if ia.is_single_integer(b):
-            self.b = Deterministic(b)
-        else:
-            self.b = b
-        """
         self.a = handle_discrete_param(a, "a")
         self.b = handle_discrete_param(b, "b")
 
@@ -562,7 +695,7 @@ class DiscreteUniform(StochasticParameter):
         if a > b:
             a, b = b, a
         elif a == b:
-            return np.tile(np.array([a]), size)
+            return np.full(size, a)
         return random_state.randint(a, b + 1, size)
 
     def __repr__(self):
@@ -570,6 +703,7 @@ class DiscreteUniform(StochasticParameter):
 
     def __str__(self):
         return "DiscreteUniform(%s, %s)" % (self.a, self.b)
+
 
 class Poisson(StochasticParameter):
     """
@@ -581,39 +715,30 @@ class Poisson(StochasticParameter):
 
     Parameters
     ----------
-    lam : number or tuple of two number or list of number or StochasticParameter
-        Lambda parameter of the poisson
-        distribution.
+    lam : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Lambda parameter of the poisson distribution.
+
             * If a number, this number will be used as a constant value.
             * If a tuple of two numbers (a, b), the value will be sampled
-              once per call to `_draw_samples()` from the range [a, b).
+              from the range ``[a, b)`` once per call
+              to :func:`imgaug.parameters.Poisson._draw_samples`.
             * If a list of numbers, a random value will be picked from the
-              list per call to `_draw_samples()`.
+              list per call.
             * If a StochasticParameter, that parameter will be queried once
-              per call to `_draw_samples()`.
+              per call.
 
     Examples
     --------
     >>> param = Poisson(1)
 
-    Sample from a poisson distribution with lambda=1.
+    Sample from a poisson distribution with ``lambda=1``.
 
     """
 
     def __init__(self, lam):
         super(Poisson, self).__init__()
 
-        if ia.is_single_number(lam):
-            self.lam = Deterministic(lam)
-        elif isinstance(lam, tuple):
-            ia.do_assert(len(lam) == 2)
-            self.lam = Uniform(lam[0], lam[1])
-        elif ia.is_iterable(lam):
-            self.lam = Choice(lam)
-        elif isinstance(lam, StochasticParameter):
-            self.lam = lam
-        else:
-            raise Exception("Expected number, tuple of two number, list of number or StochasticParameter for lam, got %s." % (type(lam),))
+        self.lam = handle_continuous_param(lam, "lam")
 
     def _draw_samples(self, size, random_state):
         lam = self.lam.draw_sample(random_state=random_state)
@@ -627,6 +752,7 @@ class Poisson(StochasticParameter):
     def __str__(self):
         return "Poisson(%s)" % (self.lam,)
 
+
 class Normal(StochasticParameter):
     """
     Parameter that resembles a (continuous) normal distribution.
@@ -635,15 +761,15 @@ class Normal(StochasticParameter):
 
     Parameters
     ----------
-    loc : number or StochasticParameter
+    loc : number or imgaug.parameters.StochasticParameter
         The mean of the normal distribution.
         If StochasticParameter, the mean will be sampled once per call
-        to `_draw_samples()`.
+        to :func:`imgaug.parameters.Normal._draw_samples`.
 
-    scale : number or StochasticParameter
+    scale : number or imgaug.parameters.StochasticParameter
         The standard deviation of the normal distribution.
         If StochasticParameter, the scale will be sampled once per call
-        to `_draw_samples()`.
+        to :func:`imgaug.parameters.Normal._draw_samples`.
 
     Examples
     --------
@@ -656,27 +782,15 @@ class Normal(StochasticParameter):
     def __init__(self, loc, scale):
         super(Normal, self).__init__()
 
-        if isinstance(loc, StochasticParameter):
-            self.loc = loc
-        elif ia.is_single_number(loc):
-            self.loc = Deterministic(loc)
-        else:
-            raise Exception("Expected float, int or StochasticParameter as loc, got %s." % (type(loc),))
-
-        if isinstance(scale, StochasticParameter):
-            self.scale = scale
-        elif ia.is_single_number(scale):
-            ia.do_assert(scale >= 0, "Expected scale to be in range [0, inf) got %s (type %s)." % (scale, type(scale)))
-            self.scale = Deterministic(scale)
-        else:
-            raise Exception("Expected float, int or StochasticParameter as scale, got %s." % (type(scale),))
+        self.loc = handle_continuous_param(loc, "loc")
+        self.scale = handle_continuous_param(scale, "scale", value_range=(0, None))
 
     def _draw_samples(self, size, random_state):
         loc = self.loc.draw_sample(random_state=random_state)
         scale = self.scale.draw_sample(random_state=random_state)
         ia.do_assert(scale >= 0, "Expected scale to be in range [0, inf), got %s." % (scale,))
         if scale == 0:
-            return np.tile(loc, size)
+            return np.full(size, loc)
         else:
             return random_state.normal(loc, scale, size=size)
 
@@ -686,37 +800,108 @@ class Normal(StochasticParameter):
     def __str__(self):
         return "Normal(loc=%s, scale=%s)" % (self.loc, self.scale)
 
+
+class TruncatedNormal(StochasticParameter):
+    """
+    Parameter that resembles a truncated normal distribution.
+
+    A truncated normal distribution is very close to a normal distribution
+    except the domain is smoothly bounded.
+
+    This is a wrapper around scipy.stats.truncnorm.
+
+    Parameters
+    ----------
+    loc : number or imgaug.parameters.StochasticParameter
+        The mean of the normal distribution.
+        If StochasticParameter, the mean will be sampled once per call
+        to :func:`imgaug.parameters.TruncatedNormal._draw_samples`.
+
+    scale : number or imgaug.parameters.StochasticParameter
+        The standard deviation of the normal distribution.
+        If StochasticParameter, the scale will be sampled once per call
+        to :func:`imgaug.parameters.TruncatedNormal._draw_samples`.
+
+    low : number or imgaug.parameters.StochasticParameter
+        The minimum value of the truncated normal distribution.
+        If StochasticParameter, the scale will be sampled once per call
+        to :func:`imgaug.parameters.TruncatedNormal._draw_samples`.
+
+    high : number or imgaug.parameters.StochasticParameter
+        The maximum value of the truncated normal distribution.
+        If StochasticParameter, the scale will be sampled once per call
+        to :func:`imgaug.parameters.TruncatedNormal._draw_samples`.
+
+    Examples
+    --------
+    >>> param = TruncatedNormal(0, 5.0, low=-10, high=10)
+    >>> samples = param.draw_samples(100, random_state=np.random.RandomState(0))
+    >>> assert np.all(samples >= -10)
+    >>> assert np.all(samples <= 10)
+
+    """
+    def __init__(self, loc, scale, low=-np.inf, high=np.inf):
+        super(TruncatedNormal, self).__init__()
+
+        self.loc = handle_continuous_param(loc, "loc")
+        self.scale = handle_continuous_param(scale, "scale", value_range=(0, None))
+        self.low = handle_continuous_param(low, "low")
+        self.high = handle_continuous_param(high, "high")
+
+    def _draw_samples(self, size, random_state):
+        loc = self.loc.draw_sample(random_state=random_state)
+        scale = self.scale.draw_sample(random_state=random_state)
+        low = self.low.draw_sample(random_state=random_state)
+        high = self.high.draw_sample(random_state=random_state)
+        if low > high:
+            low, high = high, low
+        ia.do_assert(scale >= 0, "Expected scale to be in range [0, inf), got %s." % (scale,))
+        if scale == 0:
+            return np.full(size, fill_value=loc, dtype=np.float64)
+        a = (low - loc) / scale
+        b = (high - loc) / scale
+        rv = scipy.stats.truncnorm(a=a, b=b, loc=loc, scale=scale)
+        return rv.rvs(size=size, random_state=random_state)
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        return "TruncatedNormal(loc=%s, scale=%s, low=%s, high=%s)" % (
+            self.loc, self.scale, self.low, self.high)
+
+
 class Laplace(StochasticParameter):
     """
     Parameter that resembles a (continuous) laplace distribution.
 
-    This is a wrapper around numpy's random.laplace().
+    This is a wrapper around numpy's :func:`numpy.random.laplace`.
 
     Parameters
     ----------
-    loc : number or tuple of two number or list of number or StochasticParameter
-        The position of the distribution peak, similar to the mean in normal
-        distributions.
-            * If a single number, this number will be used as a constant value.
-            * If a tuple of two numbers (a, b), the value will be sampled
-              once per call to `_draw_samples()` from the continuous
-              range [a, b).
-            * If a list of numbers, a random value will be picked from the
-              list per call to `_draw_samples()`.
-            * If a StochasticParameter, that parameter will be queried once
-              per call to `_draw_samples()`.
+    loc : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        The position of the distribution peak, similar to the mean in normal distributions.
 
-    scale : number or tuple of two number or list of number or StochasticParameter
-        The exponential decay factor, similar to standard deviation in
-        normal distributions.
             * If a single number, this number will be used as a constant value.
-            * If a tuple of two numbers (a, b), the value will be sampled
-              once per call to `_draw_samples()` from the continuous
-              range [a, b).
+            * If a tuple of two numbers ``(a, b)``, the value will be sampled
+              from the continuous range ``[a, b)`` once per call to
+              :func:`imgaug.parameters.Laplace._draw_samples`
             * If a list of numbers, a random value will be picked from the
-              list per call to `_draw_samples()`.
+              list per call.
             * If a StochasticParameter, that parameter will be queried once
-              per call to `_draw_samples()`.
+              per call.
+
+    scale : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        The exponential decay factor, similar to standard deviation in normal distributions.
+
+            * If a single number, this number will be used as a constant value.
+            * If a tuple of two numbers ``(a, b)``, the value will be sampled
+              from the continuous range [a, b). once per call
+              to :func:`imgaug.parameters.Laplace._draw_samples`
+            * If a list of numbers, a random value will be picked from the
+              list per call.
+            * If a StochasticParameter, that parameter will be queried once
+              per call.
 
     Examples
     --------
@@ -729,14 +914,14 @@ class Laplace(StochasticParameter):
         super(Laplace, self).__init__()
 
         self.loc = handle_continuous_param(loc, "loc")
-        self.scale = handle_continuous_param(scale, "scale")
+        self.scale = handle_continuous_param(scale, "scale", value_range=(0, None))
 
     def _draw_samples(self, size, random_state):
         loc = self.loc.draw_sample(random_state=random_state)
         scale = self.scale.draw_sample(random_state=random_state)
         ia.do_assert(scale >= 0, "Expected scale to be in range [0, inf), got %s." % (scale,))
         if scale == 0:
-            return np.tile(loc, size)
+            return np.full(size, loc)
         else:
             return random_state.laplace(loc, scale, size=size)
 
@@ -746,25 +931,27 @@ class Laplace(StochasticParameter):
     def __str__(self):
         return "Laplace(loc=%s, scale=%s)" % (self.loc, self.scale)
 
+
 class ChiSquare(StochasticParameter):
     """
     Parameter that resembles a (continuous) chi-square distribution.
 
-    This is a wrapper around numpy's random.chisquare().
+    This is a wrapper around numpy's :func:`numpy.random.chisquare`.
 
     Parameters
     ----------
-    df : int or tuple of two int or list of int or StochasticParameter
+    df : int or tuple of two int or list of int or imgaug.parameters.StochasticParameter
         Degrees of freedom (must be 1 or
         higher).
+
             * If a single int, this int will be used as a constant value.
-            * If a tuple of two ints (a, b), the value will be sampled
-              once per call to `_draw_samples()` from the discrete
-              range [a..b].
+            * If a tuple of two ints ``(a, b)``, the value will be sampled
+              from the discrete range ``[a..b]`` once per call
+              to :func:`imgaug.parameters.ChiSquare._draw_samples`
             * If a list of ints, a random value will be picked from the
-              list per call to `_draw_samples()`.
+              list per call.
             * If a StochasticParameter, that parameter will be queried once
-              per call to `_draw_samples()`.
+              per call.
 
     Examples
     --------
@@ -789,25 +976,26 @@ class ChiSquare(StochasticParameter):
     def __str__(self):
         return "ChiSquare(df=%s)" % (self.df,)
 
+
 class Weibull(StochasticParameter):
     """
     Parameter that resembles a (continuous) weibull distribution.
 
-    This is a wrapper around numpy's random.weibull().
+    This is a wrapper around numpy's :func:`numpy.random.weibull`.
 
     Parameters
     ----------
-    a : number or tuple of two number or list of number or StochasticParameter
-        Shape parameter of the
-        distribution.
+    a : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Shape parameter of the distribution.
+
             * If a single number, this number will be used as a constant value.
             * If a tuple of two numbers (a, b), the value will be sampled
-              once per call to `_draw_samples()` from the continuous
-              range [a, b).
+              from the continuous range ``[a, b)`` once per call
+              to :func:`imgaug.parameters.Weibull._draw_samples`.
             * If a list of numbers, a random value will be picked from the
-              list per call to `_draw_samples()`.
+              list per call.
             * If a StochasticParameter, that parameter will be queried once
-              per call to `_draw_samples()`.
+              per call.
 
     Examples
     --------
@@ -832,43 +1020,35 @@ class Weibull(StochasticParameter):
     def __str__(self):
         return "Weibull(a=%s)" % (self.a,)
 
+
+# TODO rename (a, b) to (low, high) as in numpy?
 class Uniform(StochasticParameter):
     """
     Parameter that resembles a (continuous) uniform range [a, b).
 
     Parameters
     ----------
-    {a, b} : number or tuple of two number or list of number or StochasticParameter
-        Lower and upper bound of the sampling range. Values will be sampled
-        from a <= x < b. All sampled values will be continuous. If a or b is
-        a StochasticParameter, it will be queried once per sampling to
-        estimate the value of a/b. If a>b, the values will automatically be
-        flipped. If a==b, all generated values will be identical to a.
+    a : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Lower bound of the sampling range. Values will be sampled from ``a<=x<b``. All sampled values will be
+        continuous. If `a` is a StochasticParameter, it will be queried once per sampling to estimate the value
+        of `a`. If ``a>b``, the values will automatically be flipped. If ``a==b``, all generated values will
+        be identical to `a`.
+
+    b : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Upper bound of the sampling range. Values will be sampled from ``a<=x<b``. All sampled values will be
+        continuous. If `b` is a StochasticParameter, it will be queried once per sampling to estimate the value
+        of `b`. If ``a>b``, the values will automatically be flipped. If ``a==b``, all generated values will
+        be identical to `a`.
 
     Examples
     --------
     >>> param = Uniform(0, 10.0)
 
-    Samples random values from the range [0, 10.0).
+    Samples random values from the range ``[0, 10.0)``.
 
     """
     def __init__(self, a, b):
         super(Uniform, self).__init__()
-
-        """
-        ia.do_assert(isinstance(a, (int, float, StochasticParameter)), "Expected a to be int, float or StochasticParameter, got %s" % (type(a),))
-        ia.do_assert(isinstance(b, (int, float, StochasticParameter)), "Expected b to be int, float or StochasticParameter, got %s" % (type(b),))
-
-        if ia.is_single_number(a):
-            self.a = Deterministic(a)
-        else:
-            self.a = a
-
-        if ia.is_single_number(b):
-            self.b = Deterministic(b)
-        else:
-            self.b = b
-        """
 
         self.a = handle_continuous_param(a, "a")
         self.b = handle_continuous_param(b, "b")
@@ -879,7 +1059,7 @@ class Uniform(StochasticParameter):
         if a > b:
             a, b = b, a
         elif a == b:
-            return np.tile(np.array([a]), size)
+            return np.full(size, a)
         return random_state.uniform(a, b, size)
 
     def __repr__(self):
@@ -888,28 +1068,32 @@ class Uniform(StochasticParameter):
     def __str__(self):
         return "Uniform(%s, %s)" % (self.a, self.b)
 
+
 class Beta(StochasticParameter):
     """
     Parameter that resembles a (continuous) beta distribution.
 
     Parameters
     ----------
-    {alpha, beta} : number or tuple of two number or list of number or StochasticParameter
-        alpha and beta parameters of the beta
-        distribution.
+    alpha : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        alpha parameter of the beta distribution.
+
             * If number, that number will always be used.
-            * If tuple of two number, a random value will be sampled per
-              call to `_draw_samples()` from the range [a, b).
+            * If tuple of two number, a random value will be sampled
+              from the range ``[a, b)`` once per call
+              to :func:`imgaug.parameters.Beta._draw_samples` .
             * If list of number, a random element from that list will be
-              sampled per call to `_draw_samples()`.
+              sampled per call.
             * If a StochasticParameter, a random value will be sampled
-              from that parameter per call to `_draw_samples()`.
-        alpha and beta have to be values above 0. If they end up <=0 they
-        are automatically clipped to 0+epsilon.
+              from that parameter per call.
+
+        alpha has to be a value above 0. If it ends up ``<=0`` it is automatically clipped to ``0+epsilon``.
+
+    beta : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Beta parameter of the Beta distribution. Analogous to `alpha`.
 
     epsilon : number
-        Clipping parameter. If alpha or beta end up <=0, they are clipped to
-        0+epsilon.
+        Clipping parameter. If `alpha` or `beta` end up ``<=0``, they are clipped to ``0+epsilon``.
 
     Examples
     --------
@@ -921,21 +1105,8 @@ class Beta(StochasticParameter):
     def __init__(self, alpha, beta, epsilon=0.0001):
         super(Beta, self).__init__()
 
-        def handle_param(param, name):
-            if ia.is_single_number(param):
-                return Deterministic(param)
-            elif isinstance(param, tuple):
-                ia.do_assert(len(param) == 2)
-                return Uniform(param[0], param[1])
-            elif ia.is_iterable(param):
-                return Choice(param)
-            elif isinstance(param, StochasticParameter):
-                return param
-            else:
-                raise Exception("Expected number, tuple of two number, list of number or StochasticParameter for %s, got %s." % (name, type(param),))
-
-        self.alpha = handle_param(alpha, "alpha")
-        self.beta = handle_param(beta, "beta")
+        self.alpha = handle_continuous_param(alpha, "alpha")
+        self.beta = handle_continuous_param(beta, "beta")
 
         ia.do_assert(ia.is_single_number(epsilon))
         self.epsilon = epsilon
@@ -953,114 +1124,66 @@ class Beta(StochasticParameter):
     def __str__(self):
         return "Beta(%s, %s)" % (self.alpha, self.beta)
 
-class Deterministic(StochasticParameter):
-    """
-    Parameter that resembles a constant value.
-
-    If N values are sampled from this parameter, it will return N times V,
-    where V is the constant value.
-
-    Parameters
-    ----------
-    value : number or string or StochasticParameter
-        A constant value to use.
-        A string may be provided to generate arrays of strings.
-        If this is a StochasticParameter, a single value will be sampled
-        from it exactly once and then used as the constant value.
-
-    Examples
-    --------
-    >>> param = Deterministic(10)
-
-    Will always sample the value 10.
-
-    """
-    def __init__(self, value):
-        super(Deterministic, self).__init__()
-
-        if isinstance(value, StochasticParameter):
-            self.value = value.draw_sample()
-        elif ia.is_single_number(value) or ia.is_string(value):
-            self.value = value
-        else:
-            raise Exception("Expected StochasticParameter object or number or string, got %s." % (type(value),))
-
-    def _draw_samples(self, size, random_state):
-        return np.tile(np.array([self.value]), size)
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __str__(self):
-        if ia.is_single_integer(self.value):
-            return "Deterministic(int %d)" % (self.value,)
-        elif ia.is_single_float(self.value):
-            return "Deterministic(float %.8f)" % (self.value,)
-        else:
-            return "Deterministic(%s)" % (str(self.value),)
 
 class FromLowerResolution(StochasticParameter):
     """
-    A meta parameter used to sample other parameter values on a low resolution
-    2d plane (where 2d means of size (H,W,C)).
+    A meta parameter used to sample other parameter values on a low resolution 2d plane.
 
-    This is intended to be used with parameters that would usually sample
-    once value per pixel (or one value per pixel and channel). With this
+    Here, '2d' denotes shapes of (H, W, C).
+
+    This parameter is intended to be used with parameters that would usually sample
+    one value per pixel (or one value per pixel and channel). With this
     parameter, the sampling can be made more coarse, i.e. the result will
     become rectangles instead of single pixels.
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        The other parameter which is to be sampled on a coarser
-        image.
+    other_param : imgaug.parameters.StochasticParameter
+        The other parameter which is to be sampled on a coarser image.
 
-    size_percent : None or number or iterable of two numbers or StochasticParameter, optional(default=None)
+    size_percent : None or number or iterable of number or imgaug.parameters.StochasticParameter, optional
         Size of the 2d sampling plane in percent of the requested size.
-        I.e. this is relative to the size provided in the call to
-        `_draw_samples(size, ...)`. Lower values will result in smaller
-        sampling planes, which are then upsampled to `size`. This means that
-        lower values will result in larger rectangles.
-        The size may be provided as a constant value or a tuple (a, b), which
-        will automatically be converted to the continuous uniform range [a, b)
-        or a StochasticParameter, which will be queried per call to
-        `_draw_samples()`.
+        I.e. this is relative to the size provided in the call to ``draw_samples(size)``.
+        Lower values will result in smaller sampling planes, which are then upsampled to `size`.
+        This means that lower values will result in larger rectangles.
+        The size may be provided as a constant value or a tuple ``(a, b)``, which
+        will automatically be converted to the continuous uniform range ``[a, b)``
+        or a StochasticParameter, which will be queried per call to ``draw_samples()``.
 
-    size_px : None or number or iterable of two numbers or StochasticParameter, optional(default=None)
+    size_px : None or number or iterable of numbers or imgaug.parameters.StochasticParameter, optional
         Size of the 2d sampling plane in pixels.
         Lower values will result in smaller sampling planes, which are then
-        upsampled to the input `size` of `draw_samples(size, ...)`.
+        upsampled to the input `size` of ``draw_samples(size)``.
         This means that lower values will result in larger rectangles.
-        The size may be provided as a constant value or a tuple (a, b), which
-        will automatically be converted to the discrete uniform range [a..b]
+        The size may be provided as a constant value or a tuple ``(a, b)``, which
+        will automatically be converted to the discrete uniform range ``[a..b]``
         or a StochasticParameter, which will be queried per call to
-        `_draw_samples()`.
+        ``draw_samples()``.
 
-    method : string or int or StochasticParameter, optional(default="nearest")
+    method : str or int or imgaug.parameters.StochasticParameter, optional
         Upsampling/interpolation method to use. This is used after the sampling
         is finished and the low resolution plane has to be upsampled to the
-        requested `size` in `_draw_samples(size, ...)`. The method may be
-        the same as in `imgaug.imresize_many_images()`. Usually `nearest`
-        or `linear` are good choices. `nearest` will result in rectangles
-        with sharp edges and `linear` in rectangles with blurry and round
+        requested `size` in ``draw_samples(size, ...)``. The method may be
+        the same as in :func:`imgaug.imgaug.imresize_many_images`. Usually ``nearest``
+        or ``linear`` are good choices. ``nearest`` will result in rectangles
+        with sharp edges and ``linear`` in rectangles with blurry and round
         edges. The method may be provided as a StochasticParameter, which
-        will be queried per call to `_draw_samples()`.
+        will be queried per call to ``draw_samples()``.
 
-    min_size : int, optional(default=1)
-        Minimum size in pixels of the low resolution sampling
-        plane.
+    min_size : int, optional
+        Minimum size in pixels of the low resolution sampling plane.
 
     Examples
     --------
     >>> param = FromLowerResolution(Binomial(0.05), size_px=(2, 16), method=Choice(["nearest", "linear"]))
 
-    Samples from a binomial distribution with p=0.05. The sampling plane
+    Samples from a binomial distribution with ``p=0.05``. The sampling plane
     will always have a size HxWxC with H and W being independently sampled
-    from [2..16] (i.e. it may range from 2x2xC up to 16x16xC max, but may
-    also be e.g. 4x8xC). The upsampling method will be "nearest" in 50 percent
-    of all cases and "linear" in the other 50 percent. The result will
-    sometimes be rectangular patches of sharp 1s surrounded by 0s and
-    sometimes blurry blobs of 1s, surrounded by values <1.0.
+    from ``[2..16]`` (i.e. it may range from ``2x2xC`` up to ``16x16xC`` max, but may
+    also be e.g. ``4x8xC``). The upsampling method will be ``nearest`` in 50 percent
+    of all cases and ``linear`` in the other 50 percent. The result will
+    sometimes be rectangular patches of sharp ``1``s surrounded by ``0``s and
+    sometimes blurry blobs of ``1``s, surrounded by values ``<1.0``.
 
     """
     def __init__(self, other_param, size_percent=None, size_px=None, method="nearest", min_size=1):
@@ -1079,8 +1202,9 @@ class FromLowerResolution(StochasticParameter):
             elif isinstance(size_percent, StochasticParameter):
                 self.size_percent = size_percent
             else:
-                raise Exception("Expected int, float, tuple of two ints/floats or StochasticParameter for size_percent, got %s." % (type(size_percent),))
-        else: # = elif size_px is not None:
+                raise Exception("Expected int, float, tuple of two ints/floats or StochasticParameter "
+                                + "for size_percent, got %s." % (type(size_percent),))
+        else:  # = elif size_px is not None:
             self.size_method = "px"
             self.size_percent = None
             if ia.is_single_integer(size_px):
@@ -1091,7 +1215,8 @@ class FromLowerResolution(StochasticParameter):
             elif isinstance(size_px, StochasticParameter):
                 self.size_px = size_px
             else:
-                raise Exception("Expected int, float, tuple of two ints/floats or StochasticParameter for size_px, got %s." % (type(size_px),))
+                raise Exception("Expected int, float, tuple of two ints/floats or StochasticParameter "
+                                + "for size_px, got %s." % (type(size_px),))
 
         self.other_param = other_param
 
@@ -1111,7 +1236,8 @@ class FromLowerResolution(StochasticParameter):
         elif len(size) == 4:
             n, h, w, c = size
         else:
-            raise Exception("FromLowerResolution can only generate samples of shape (H, W, C) or (N, H, W, C), requested was %s." % (str(size),))
+            raise Exception("FromLowerResolution can only generate samples of shape (H, W, C) or (N, H, W, C), "
+                            "requested was %s." % (str(size),))
 
         if self.size_method == "percent":
             hw_percents = self.size_percent.draw_samples((n, 2), random_state=random_state)
@@ -1121,16 +1247,36 @@ class FromLowerResolution(StochasticParameter):
 
         methods = self.method.draw_samples((n,), random_state=random_state)
         result = None
-        #for i, (size_factor, method) in enumerate(zip(size_factors, methods)):
         for i, (hw_px, method) in enumerate(zip(hw_pxs, methods)):
-            #h_small = max(int(h * size_factor), self.min_size)
-            #w_small = max(int(w * size_factor), self.min_size)
             h_small = max(hw_px[0], self.min_size)
             w_small = max(hw_px[1], self.min_size)
             samples = self.other_param.draw_samples((1, h_small, w_small, c), random_state=random_state)
+
+            # This (1) makes sure that samples are of dtypes supported by imresize_many_images,
+            # and (2) forces samples to be float-kind if the requested interpolation is something
+            # else than nearest neighbour interpolation. (2) is a bit hacky and makes sure that
+            # continuous values are produced for e.g. cubic interpolation. This is particularly
+            # important for e.g. binomial distributios used in FromLowerResolution and thereby in
+            # e.g. CoarseDropout, where integer-kinds would lead to sharp edges despite using
+            # cubic interpolation.
+            if samples.dtype.kind == "f":
+                samples = iadt.restore_dtypes_(samples, np.float32)
+            elif samples.dtype.kind == "i":
+                if method == "nearest":
+                    samples = iadt.restore_dtypes_(samples, np.int32)
+                else:
+                    samples = iadt.restore_dtypes_(samples, np.float32)
+            else:
+                assert samples.dtype.kind == "u"
+                if method == "nearest":
+                    samples = iadt.restore_dtypes_(samples, np.uint16)
+                else:
+                    samples = iadt.restore_dtypes_(samples, np.float32)
+
             samples_upscaled = ia.imresize_many_images(samples, (h, w), interpolation=method)
+
             if result is None:
-                result = np.zeros((n, h, w, c), dtype=samples.dtype)
+                result = np.zeros((n, h, w, c), dtype=samples_upscaled.dtype)
             result[i] = samples_upscaled
 
         if len(size) == 3:
@@ -1143,9 +1289,12 @@ class FromLowerResolution(StochasticParameter):
 
     def __str__(self):
         if self.size_method == "percent":
-            return "FromLowerResolution(size_percent=%s, method=%s, other_param=%s)" % (self.size_percent, self.method, self.other_param)
+            return "FromLowerResolution(size_percent=%s, method=%s, other_param=%s)" % (
+                self.size_percent, self.method, self.other_param)
         else:
-            return "FromLowerResolution(size_px=%s, method=%s, other_param=%s)" % (self.size_px, self.method, self.other_param)
+            return "FromLowerResolution(size_px=%s, method=%s, other_param=%s)" % (
+                self.size_px, self.method, self.other_param)
+
 
 class Clip(StochasticParameter):
     """
@@ -1153,15 +1302,14 @@ class Clip(StochasticParameter):
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        The other parameter, which's values are to be
-        clipped.
+    other_param : imgaug.parameters.StochasticParameter
+        The other parameter, which's values are to be clipped.
 
-    minval : None or number, optional(default=None)
+    minval : None or number, optional
         The minimum value to use.
         If None, no minimum will be used.
 
-    maxval : None or number, optional(default=None)
+    maxval : None or number, optional
         The maximum value to use.
         If None, no maximum will be used.
 
@@ -1188,14 +1336,8 @@ class Clip(StochasticParameter):
 
     def _draw_samples(self, size, random_state):
         samples = self.other_param.draw_samples(size, random_state=random_state)
-        if self.minval is not None and self.maxval is not None:
-            np.clip(samples, self.minval, self.maxval, out=samples)
-        elif self.minval is not None:
-            np.clip(samples, self.minval, np.max(samples), out=samples)
-        elif self.maxval is not None:
-            np.clip(samples, np.min(samples), self.maxval, out=samples)
-        else:
-            pass
+        if self.minval is not None or self.maxval is not None:
+            samples = np.clip(samples, self.minval, self.maxval, out=samples)
         return samples
 
     def __repr__(self):
@@ -1212,6 +1354,7 @@ class Clip(StochasticParameter):
         else:
             return "Clip(%s, None, None)" % (opstr,)
 
+
 class Discretize(StochasticParameter):
     """
     Convert values sampled from a continuous distribution into discrete values.
@@ -1221,9 +1364,8 @@ class Discretize(StochasticParameter):
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        The other parameter, which's values are to be
-        discretized.
+    other_param : imgaug.parameters.StochasticParameter
+        The other parameter, which's values are to be discretized.
 
     Examples
     --------
@@ -1238,14 +1380,20 @@ class Discretize(StochasticParameter):
         self.other_param = other_param
 
     def _draw_samples(self, size, random_state):
-        samples = self.other_param.draw_samples(
-            size, random_state=random_state
-        )
-        if isinstance(samples.dtype, numbers.Integral):
-            # integer array, already discrete
+        samples = self.other_param.draw_samples(size, random_state=random_state)
+        if samples.dtype.kind in ["u", "i", "b"]:
             return samples
-        else:
-            return np.round(samples).astype(np.int32)
+
+        # dtype of ``samples`` should be float at this point
+        assert samples.dtype.kind == "f", "Expected to get uint, int, bool or float dtype as samples in Discretize(), " \
+                                          "but got dtype '%s' (kind '%s') instead." % (
+                                            samples.dtype.name, samples.dtype.kind)
+        # floats seem to reliably cover ints that have half the number of bits -- probably not the case for float128
+        # though as that is really float96
+        bitsize = 8 * samples.dtype.itemsize // 2
+        bitsize = max(bitsize, 8)  # in case some weird system knows something like float8 -- shouldn't happen though
+        dt = np.dtype("int%d" % (bitsize,))
+        return np.round(samples).astype(dt)
 
     def __repr__(self):
         return self.__str__()
@@ -1254,26 +1402,26 @@ class Discretize(StochasticParameter):
         opstr = str(self.other_param)
         return "Discretize(%s)" % (opstr,)
 
+
 class Multiply(StochasticParameter):
     """
     Parameter to multiply other parameter's results with.
 
     Parameters
     ----------
-    other_param : number or tuple of two number or list of number or StochasticParameter
-        Other parameter which's sampled values are to be
-        multiplied.
+    other_param : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be multiplied.
 
-    val : number or tuple of two number or list of number or StochasticParameter
+    val : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
         Multiplier to use. If this is a StochasticParameter, either
         a single or multiple values will be sampled and used as the
         multiplier(s).
 
-    elementwise : bool, optional(default=False)
+    elementwise : bool, optional
         Controls the sampling behaviour when `val` is a StochasticParameter.
         If set to False, a single value will be sampled from val and used as
         the constant multiplier.
-        If set to True and `_draw_samples(size=S)` is called, `S` values will
+        If set to True and ``_draw_samples(size=S)`` is called, ``S`` values will
         be sampled from `val` and multiplied elementwise with the results
         of `other_param`.
 
@@ -1281,7 +1429,7 @@ class Multiply(StochasticParameter):
     --------
     >>> param = Multiply(Uniform(0.0, 1.0), -1)
 
-    Converts a uniform range [0.0, 1.0) to (-1.0, 0.0].
+    Converts a uniform range ``[0.0, 1.0)`` to ``(-1.0, 0.0]``.
 
     """
     def __init__(self, other_param, val, elementwise=False):
@@ -1292,6 +1440,7 @@ class Multiply(StochasticParameter):
         self.elementwise = elementwise
 
     def _draw_samples(self, size, random_state):
+        # TODO replace with derive_random_state()
         seed = random_state.randint(0, 10**6, 1)[0]
         samples = self.other_param.draw_samples(size, random_state=ia.new_random_state(seed))
 
@@ -1313,6 +1462,7 @@ class Multiply(StochasticParameter):
     def __str__(self):
         return "Multiply(%s, %s, %s)" % (str(self.other_param), str(self.val), self.elementwise)
 
+
 class Divide(StochasticParameter):
     """
     Parameter to divide other parameter's results with.
@@ -1322,20 +1472,19 @@ class Divide(StochasticParameter):
 
     Parameters
     ----------
-    other_param : number or tuple of two number or list of number or StochasticParameter
-        Other parameter which's sampled values are to be
-        divided.
+    other_param : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be divided.
 
-    val : number or tuple of two number or list of number or StochasticParameter
+    val : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
         Denominator to use. If this is a StochasticParameter, either
         a single or multiple values will be sampled and used as the
         denominator(s).
 
-    elementwise : bool, optional(default=False)
+    elementwise : bool, optional
         Controls the sampling behaviour when `val` is a StochasticParameter.
         If set to False, a single value will be sampled from val and used as
         the constant denominator.
-        If set to True and `_draw_samples(size=S)` is called, `S` values will
+        If set to True and ``_draw_samples(size=S)`` is called, ``S`` values will
         be sampled from `val` and used as the elementwise denominators for the
         results of `other_param`.
 
@@ -1343,7 +1492,7 @@ class Divide(StochasticParameter):
     --------
     >>> param = Divide(Uniform(0.0, 1.0), 2)
 
-    Converts a uniform range [0.0, 1.0) to [0, 0.5).
+    Converts a uniform range ``[0.0, 1.0)`` to ``[0, 0.5)``.
 
     """
     def __init__(self, other_param, val, elementwise=False):
@@ -1354,6 +1503,7 @@ class Divide(StochasticParameter):
         self.elementwise = elementwise
 
     def _draw_samples(self, size, random_state):
+        # TODO replace with derive_random_state()
         seed = random_state.randint(0, 10**6, 1)[0]
         samples = self.other_param.draw_samples(size, random_state=ia.new_random_state(seed))
 
@@ -1368,7 +1518,7 @@ class Divide(StochasticParameter):
             # prevent division by zero
             val_samples[val_samples == 0] = 1
 
-            return np.multiply(
+            return np.divide(
                 force_np_float_dtype(samples),
                 force_np_float_dtype(val_samples)
             )
@@ -1389,33 +1539,33 @@ class Divide(StochasticParameter):
     def __str__(self):
         return "Divide(%s, %s, %s)" % (str(self.other_param), str(self.val), self.elementwise)
 
+
 class Add(StochasticParameter):
     """
     Parameter to add to other parameter's results.
 
     Parameters
     ----------
-    other_param : number or tuple of two number or list of number or StochasticParameter
-        Other parameter which's sampled values are to be
-        modified.
+    other_param : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be modified.
 
-    val : number or tuple of two number or list of number or StochasticParameter
+    val : number or tuple of two number or list of number or imgaug.parameters.StochasticParameter
         Value to add to the other parameter's results. If this is a
         StochasticParameter, either a single or multiple values will be
         sampled and added.
 
-    elementwise : bool, optional(default=False)
+    elementwise : bool, optional
         Controls the sampling behaviour when `val` is a StochasticParameter.
         If set to False, a single value will be sampled from val and added
         to all values generated by `other_param`.
-        If set to True and `_draw_samples(size=S)` is called, `S` values will
+        If set to True and ``_draw_samples(size=S)`` is called, ``S`` values will
         be sampled from `val` and added to the results of `other_param`.
 
     Examples
     --------
     >>> param = Add(Uniform(0.0, 1.0), 1.0)
 
-    Converts a uniform range [0.0, 1.0) to [1.0, 2.0).
+    Converts a uniform range ``[0.0, 1.0)`` to ``[1.0, 2.0)``.
 
     """
     def __init__(self, other_param, val, elementwise=False):
@@ -1426,6 +1576,7 @@ class Add(StochasticParameter):
         self.elementwise = elementwise
 
     def _draw_samples(self, size, random_state):
+        # TODO replace with derive_random_state()
         seed = random_state.randint(0, 10**6, 1)[0]
         samples = self.other_param.draw_samples(size, random_state=ia.new_random_state(seed))
 
@@ -1447,33 +1598,33 @@ class Add(StochasticParameter):
     def __str__(self):
         return "Add(%s, %s, %s)" % (str(self.other_param), str(self.val), self.elementwise)
 
+
 class Subtract(StochasticParameter):
     """
     Parameter to subtract from another parameter's results.
 
     Parameters
     ----------
-    other_param : number or tuple of two number or list of number or StochasticParameter
-        Other parameter which's sampled values are to be
-        modified.
+    other_param : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be modified.
 
-    val : number or tuple of two number or list of number or StochasticParameter
+    val : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
         Value to add to the other parameter's results. If this is a
         StochasticParameter, either a single or multiple values will be
         sampled and subtracted.
 
-    elementwise : bool, optional(default=False)
+    elementwise : bool, optional
         Controls the sampling behaviour when `val` is a StochasticParameter.
         If set to False, a single value will be sampled from val and subtracted
         from all values generated by `other_param`.
-        If set to True and `_draw_samples(size=S)` is called, `S` values will
+        If set to True and ``_draw_samples(size=S)`` is called, ``S`` values will
         be sampled from `val` and subtracted from the results of `other_param`.
 
     Examples
     --------
-    >>> param = Add(Uniform(0.0, 1.0), 1.0)
+    >>> param = Subtract(Uniform(0.0, 1.0), 1.0)
 
-    Converts a uniform range [0.0, 1.0) to [1.0, 2.0).
+    Converts a uniform range ``[0.0, 1.0)`` to ``[-1.0, 0.0)``.
 
     """
     def __init__(self, other_param, val, elementwise=False):
@@ -1484,6 +1635,7 @@ class Subtract(StochasticParameter):
         self.elementwise = elementwise
 
     def _draw_samples(self, size, random_state):
+        # TODO replace with derive_random_state()
         seed = random_state.randint(0, 10**6, 1)[0]
         samples = self.other_param.draw_samples(size, random_state=ia.new_random_state(seed))
 
@@ -1505,26 +1657,26 @@ class Subtract(StochasticParameter):
     def __str__(self):
         return "Subtract(%s, %s, %s)" % (str(self.other_param), str(self.val), self.elementwise)
 
+
 class Power(StochasticParameter):
     """
     Parameter to exponentiate another parameter's results with.
 
     Parameters
     ----------
-    other_param : number or tuple of two number or list of number or StochasticParameter
-        Other parameter which's sampled values are to be
-        modified.
+    other_param : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be modified.
 
-    val : number or tuple of two number or list of number or StochasticParameter
+    val : number or tuple of number or list of number or imgaug.parameters.StochasticParameter
         Value to use exponentiate the other parameter's results with. If this
         is a StochasticParameter, either a single or multiple values will be
         sampled and used as the exponents.
 
-    elementwise : bool, optional(default=False)
+    elementwise : bool, optional
         Controls the sampling behaviour when `val` is a StochasticParameter.
         If set to False, a single value will be sampled from val and used as
         the exponent for all values generated by `other_param`.
-        If set to True and `_draw_samples(size=S)` is called, `S` values will
+        If set to True and ``_draw_samples(size=S)`` is called, ``S`` values will
         be sampled from `val` and used as the exponents for the results of
         `other_param`.
 
@@ -1532,7 +1684,7 @@ class Power(StochasticParameter):
     --------
     >>> param = Power(Uniform(0.0, 1.0), 2)
 
-    Converts a uniform range [0.0, 1.0) to a distribution that is peaked
+    Converts a uniform range ``[0.0, 1.0)`` to a distribution that is peaked
     towards 1.0.
 
     """
@@ -1559,10 +1711,10 @@ class Power(StochasticParameter):
         samples, exponents = both_np_float_if_one_is_float(samples, exponents)
         samples_dtype = samples.dtype
 
+        # TODO switch to this as numpy>=1.15 is now a requirement
         # float_power requires numpy>=1.12
-        #result = np.float_power(samples, exponents)
-        # TODO why was float32 type here replaced with complex number
-        # formulation?
+        # result = np.float_power(samples, exponents)
+        # TODO why was float32 type here replaced with complex number formulation?
         result = np.power(samples.astype(np.complex), exponents).real
         if result.dtype != samples_dtype:
             result = result.astype(samples_dtype)
@@ -1575,21 +1727,21 @@ class Power(StochasticParameter):
     def __str__(self):
         return "Power(%s, %s, %s)" % (str(self.other_param), str(self.val), self.elementwise)
 
+
 class Absolute(StochasticParameter):
     """
     Converts another parameter's results to absolute values.
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        Other parameter which's sampled values are to be
-        modified.
+    other_param : imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be modified.
 
     Examples
     --------
     >>> param = Absolute(Uniform(-1.0, 1.0))
 
-    Converts a uniform range [-1.0, 1.0) to [0.0, 1.0].
+    Converts a uniform range ``[-1.0, 1.0)`` to ``[0.0, 1.0]``.
 
     """
     def __init__(self, other_param):
@@ -1610,6 +1762,7 @@ class Absolute(StochasticParameter):
         opstr = str(self.other_param)
         return "Absolute(%s)" % (opstr,)
 
+
 class RandomSign(StochasticParameter):
     """
     Converts another parameter's results randomly to positive or negative
@@ -1617,20 +1770,17 @@ class RandomSign(StochasticParameter):
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        Other parameter which's sampled values are to be
-        modified.
+    other_param : imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be modified.
 
     p_positive : number
-        Fraction of values that are supposed to be turned to positive
-        values.
+        Fraction of values that are supposed to be turned to positive values.
 
     Examples
     --------
     >>> param = RandomSign(Poisson(1))
 
-    Generates a poisson distribution with alpha=1 that is mirrored at the
-    y-axis.
+    Generates a poisson distribution with ``alpha=1`` that is mirrored at the y-axis.
 
     """
     def __init__(self, other_param, p_positive=0.5):
@@ -1644,19 +1794,18 @@ class RandomSign(StochasticParameter):
         self.p_positive = p_positive
 
     def _draw_samples(self, size, random_state):
-        samples = self.other_param.draw_samples(
-            size,
-            random_state=ia.copy_random_state(random_state)
-        )
-        coinflips = ia.copy_random_state(random_state).binomial(
-            1, self.p_positive, size=size
-        ).astype(np.int32)
+        rss = ia.derive_random_states(random_state, 2)
+        samples = self.other_param.draw_samples(size, random_state=rss[0])
+        # TODO add method to change from uint to int here instead of assert
+        assert samples.dtype.kind != "u", "Cannot flip signs of unsigned integers."
+        # TODO convert to same kind as samples
+        coinflips = rss[1].binomial(1, self.p_positive, size=size).astype(np.int8)
         signs = coinflips * 2 - 1
         # Add absolute here to guarantee that we get p_positive percent of
         # positive values. Otherwise we would merely flip p_positive percent
         # of all signs.
+        # TODO test if result[coinflips_mask] *= (-1) is faster  (with protection against mask being empty?)
         result = np.absolute(samples) * signs
-        #print("[RandomSign] ", size, coinflips.shape, signs.shape, result.shape, result[0:10])
         return result
 
     def __repr__(self):
@@ -1666,38 +1815,37 @@ class RandomSign(StochasticParameter):
         opstr = str(self.other_param)
         return "RandomSign(%s, %.2f)" % (opstr, self.p_positive)
 
+
 class ForceSign(StochasticParameter):
     """
     Converts another parameter's results to positive or negative values.
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        Other parameter which's sampled values are to be
-        modified.
+    other_param : imgaug.parameters.StochasticParameter
+        Other parameter which's sampled values are to be modified.
 
     positive : bool
-        Whether to force all signs to be positive/+ (True) or
-        negative/- (False).
+        Whether to force all signs to be positive/+ (True) or negative/- (False).
 
-    mode : string, optional(default="invert")
-        How to change the signs. Valid values are "invert" and "reroll".
-        "invert" means that wrong signs are simply flipped.
-        "reroll" means that all samples with wrong signs are sampled again,
+    mode : {'invert', 'reroll'}, optional
+        How to change the signs. Valid values are ``invert`` and ``reroll``.
+        ``invert`` means that wrong signs are simply flipped.
+        ``reroll`` means that all samples with wrong signs are sampled again,
         optionally many times, until they randomly end up having the correct
         sign.
 
-    reroll_count_max : int, optional(default=2)
-        If `mode` is set to "reroll", this determines how often values may
+    reroll_count_max : int, optional
+        If `mode` is set to ``reroll``, this determines how often values may
         be rerolled before giving up and simply flipping the sign (as in
-        mode="invert"). This shouldn't be set too high, as rerolling is
+        ``mode="invert"``). This shouldn't be set too high, as rerolling is
         expensive.
 
     Examples
     --------
     >>> param = ForceSign(Poisson(1), positive=False)
 
-    Generates a poisson distribution with alpha=1 that is flipped towards
+    Generates a poisson distribution with ``alpha=1`` that is flipped towards
     negative values.
 
     """
@@ -1767,27 +1915,28 @@ class ForceSign(StochasticParameter):
         opstr = str(self.other_param)
         return "ForceSign(%s, %s, %s, %d)" % (opstr, str(self.positive), self.mode, self.reroll_count_max)
 
+
 def Positive(other_param, mode="invert", reroll_count_max=2):
     """
     Converts another parameter's results to positive values.
 
     Parameters
     ----------
-    other_param : StochasticParameter
+    other_param : imgaug.parameters.StochasticParameter
         Other parameter which's sampled values are to be
         modified.
 
-    mode : string, optional(default="invert")
-        How to change the signs. Valid values are "invert" and "reroll".
-        "invert" means that wrong signs are simply flipped.
-        "reroll" means that all samples with wrong signs are sampled again,
+    mode : {'invert', 'reroll'}, optional
+        How to change the signs. Valid values are ``invert`` and ``reroll``.
+        ``invert`` means that wrong signs are simply flipped.
+        ``reroll`` means that all samples with wrong signs are sampled again,
         optionally many times, until they randomly end up having the correct
         sign.
 
-    reroll_count_max : int, optional(default=2)
-        If `mode` is set to "reroll", this determines how often values may
+    reroll_count_max : int, optional
+        If `mode` is set to ``reroll``, this determines how often values may
         be rerolled before giving up and simply flipping the sign (as in
-        mode="invert"). This shouldn't be set too high, as rerolling is
+        ``mode="invert"``). This shouldn't be set too high, as rerolling is
         expensive.
 
     Examples
@@ -1804,27 +1953,28 @@ def Positive(other_param, mode="invert", reroll_count_max=2):
         reroll_count_max=reroll_count_max
     )
 
+
 def Negative(other_param, mode="invert", reroll_count_max=2):
     """
     Converts another parameter's results to negative values.
 
     Parameters
     ----------
-    other_param : StochasticParameter
+    other_param : imgaug.parameters.StochasticParameter
         Other parameter which's sampled values are to be
         modified.
 
-    mode : string, optional(default="invert")
-        How to change the signs. Valid values are "invert" and "reroll".
-        "invert" means that wrong signs are simply flipped.
-        "reroll" means that all samples with wrong signs are sampled again,
+    mode : {'invert', 'reroll'}, optional
+        How to change the signs. Valid values are ``invert`` and ``reroll``.
+        ``invert`` means that wrong signs are simply flipped.
+        ``reroll`` means that all samples with wrong signs are sampled again,
         optionally many times, until they randomly end up having the correct
         sign.
 
-    reroll_count_max : int, optional(default=2)
-        If `mode` is set to "reroll", this determines how often values may
+    reroll_count_max : int, optional
+        If `mode` is set to ``reroll``, this determines how often values may
         be rerolled before giving up and simply flipping the sign (as in
-        mode="invert"). This shouldn't be set too high, as rerolling is
+        ``mode="invert"``). This shouldn't be set too high, as rerolling is
         expensive.
 
     Examples
@@ -1841,9 +1991,9 @@ def Negative(other_param, mode="invert", reroll_count_max=2):
         reroll_count_max=reroll_count_max
     )
 
-# TODO this always aggregates the result in high resolution space,
-# instead of aggregating them in low resolution and then only upscaling the
-# final image (for N iterations that would save up to N-1 upscales)
+
+# TODO this always aggregates the result in high resolution space, instead of aggregating them in low resolution and
+# then only upscaling the final image (for N iterations that would save up to N-1 upscales)
 class IterativeNoiseAggregator(StochasticParameter):
     """
     Parameter to generate noise maps in multiple iterations and aggregate
@@ -1858,25 +2008,26 @@ class IterativeNoiseAggregator(StochasticParameter):
         The noise parameter to iterate multiple
         times.
 
-    iterations : int or iterable of two ints or list of ints or StochasticParameter, optional(default=(1, 3))
+    iterations : int or iterable of int or list of int or imgaug.parameters.StochasticParameter, optional
         The number of iterations. This may be a single integer or a tuple
-        of integers (a, b), which will result in [a..b] iterations or
-        a list of integers [a, b, c, ...], which will result in a or b or
-        c, ... iterations. It may also be a StochasticParameter, in which case
+        of two integers ``(a, b)``, which will result in ``[a..b]`` iterations or
+        a list of integers ``[a, b, c, ...]``, which will result in ``a`` or ``b``
+        or ``c``, ... iterations. It may also be a StochasticParameter, in which case
         the number of iterations will be sampled once per call
-        to `_draw_samples()`.
+        to :func:`imgaug.parameters.IterativeNoiseAggregator._draw_samples`.
 
-    aggregation_method : ia.ALL or string or list of string or StochasticParameter, optional(default=["max", "avg"])
+    aggregation_method : imgaug.ALL or {'min', 'avg', 'max'} or list of str or\
+                         imgaug.parameters.StochasticParameter, optional
         The method to use to aggregate the results of multiple iterations.
-        If a string, it must have the value "min" or "max" or "avg".
-        If "min" is chosen, the elementwise minimum will be computed over
-        all iterations (pushing the noise towards zeros). "max" will result
-        in the elementwise maximum and "avg" in the average over all
-        iterations. If `ia.ALL` is used, it will be randomly either min or max
-        or avg (per call to `_draw_samples()`). If a list is chosen, it must
-        contain the mentioned strings and a random one will be picked per call
-        to `_draw_samples()`. If a StochasticParameter is used, a value will
-        be sampled from it per call to `_draw_samples()`.
+        If a string, it must have the value ``min`` or ``max`` or ``avg``.
+        If ``min`` is chosen, the elementwise minimum will be computed over
+        all iterations (pushing the noise towards zeros). ``max`` will result
+        in the elementwise maximum and ``avg`` in the average over all
+        iterations. If ``imgaug.ALL`` is used, it will be randomly either min or max
+        or avg (per call to :func:`imgaug.parameters.IterativeNoiseAggregator_draw_samples`).
+        If a list is chosen, it must contain the mentioned strings and a random
+        one will be picked per call. If a StochasticParameter is used, a value will
+        be sampled from it per call.
 
     Examples
     --------
@@ -1887,25 +2038,27 @@ class IterativeNoiseAggregator(StochasticParameter):
 
     """
     def __init__(self, other_param, iterations=(1, 3), aggregation_method=["max", "avg"]): # pylint: disable=locally-disabled, dangerous-default-value, line-too-long
+        super(IterativeNoiseAggregator, self).__init__()
         ia.do_assert(isinstance(other_param, StochasticParameter))
         self.other_param = other_param
 
         if ia.is_single_integer(iterations):
             ia.do_assert(1 <= iterations <= 1000)
             self.iterations = Deterministic(iterations)
+        elif isinstance(iterations, list):
+            ia.do_assert(len(iterations) > 0)
+            ia.do_assert(all([1 <= val <= 10000 for val in iterations]))
+            self.iterations = Choice(iterations)
         elif ia.is_iterable(iterations):
             ia.do_assert(len(iterations) == 2)
             ia.do_assert(all([ia.is_single_integer(val) for val in iterations]))
             ia.do_assert(all([1 <= val <= 10000 for val in iterations]))
             self.iterations = DiscreteUniform(iterations[0], iterations[1])
-        elif isinstance(iterations, list):
-            ia.do_assert(len(iterations) > 0)
-            ia.do_assert(all([1 <= val <= 10000 for val in iterations]))
-            self.iterations = Choice(iterations)
         elif isinstance(iterations, StochasticParameter):
             self.iterations = iterations
         else:
-            raise Exception("Expected iterations to be int or tuple of two ints or StochasticParameter, got %s." % (type(iterations),))
+            raise Exception("Expected iterations to be int or tuple of two ints or StochasticParameter, got %s." % (
+                type(iterations),))
 
         if aggregation_method == ia.ALL:
             self.aggregation_method = Choice(["min", "max", "avg"])
@@ -1918,20 +2071,18 @@ class IterativeNoiseAggregator(StochasticParameter):
         elif isinstance(aggregation_method, StochasticParameter):
             self.aggregation_method = aggregation_method
         else:
-            raise Exception("Expected aggregation_method to be string or list of strings or StochasticParameter, got %s." % (type(aggregation_method),))
+            raise Exception("Expected aggregation_method to be string or list of strings or StochasticParameter, "
+                            + "got %s." % (type(aggregation_method),))
 
     def _draw_samples(self, size, random_state):
-        ia.do_assert(len(size) == 2, "Expected requested other_param to have shape (H, W), got shape %s." % (size,))
-        h, w = size
-
         seed = random_state.randint(0, 10**6)
         aggregation_method = self.aggregation_method.draw_sample(random_state=ia.new_random_state(seed))
         iterations = self.iterations.draw_sample(random_state=ia.new_random_state(seed+1))
         ia.do_assert(iterations > 0)
 
-        result = np.zeros((h, w), dtype=np.float32)
+        result = np.zeros(size, dtype=np.float32)
         for i in sm.xrange(iterations):
-            noise_iter = self.other_param.draw_samples((h, w), random_state=ia.new_random_state(seed+2+i))
+            noise_iter = self.other_param.draw_samples(size, random_state=ia.new_random_state(seed+2+i))
             if aggregation_method == "avg":
                 result += noise_iter
             elif aggregation_method == "min":
@@ -1957,6 +2108,7 @@ class IterativeNoiseAggregator(StochasticParameter):
         opstr = str(self.other_param)
         return "IterativeNoiseAggregator(%s, %s, %s)" % (opstr, str(self.iterations), str(self.aggregation_method))
 
+
 class Sigmoid(StochasticParameter):
     """
     Applies a sigmoid function to the outputs of another parameter.
@@ -1967,33 +2119,32 @@ class Sigmoid(StochasticParameter):
 
     Parameters
     ----------
-    other_param : StochasticParameter
-        The other parameter to which the sigmoid will be
-        applied.
+    other_param : imgaug.parameters.StochasticParameter
+        The other parameter to which the sigmoid will be applied.
 
-    threshold : number or tuple of two numbers or iterable of numbers or StochasticParameter, optional(default=(-10, 10))
+    threshold : number or tuple of number or iterable of number or imgaug.parameters.StochasticParameter, optional
         Sets the value of the sigmoid's saddle point, i.e. where values
         start to quickly shift from 0.0 to 1.0.
-        This may be set using a single number, a tuple (a, b) (will result in
-        a random threshold a<=x<b per call), a list of numbers (will
+        This may be set using a single number, a tuple ``(a, b)`` (will result in
+        a random threshold ``a<=x<b`` per call), a list of numbers (will
         result in a random threshold drawn from the list per call) or a
         StochasticParameter (will be queried once per call to determine the
         threshold).
 
-    activated : bool or number, optional(default=True)
+    activated : bool or number, optional
         Defines whether the sigmoid is activated. If this is False, the
         results of other_param will not be altered. This may be set to a
-        float value p with 0<=p<=1.0, which will result in `activated` being
-        True in p percent of all calls.
+        float value ``p`` with ``0<=p<=1.0``, which will result in `activated`
+        being True in ``p`` percent of all calls.
 
-    mul : number, optional(default=1)
-        The results of other_param will be multiplied with this value before
-        applying the sigmoid. For noise values (range [0.0, 1.0]) this should
+    mul : number, optional
+        The results of `other_param` will be multiplied with this value before
+        applying the sigmoid. For noise values (range ``[0.0, 1.0]``) this should
         be set to about 20.
 
-    add : number, optional(default=0)
-        This value will be added to the results of other_param before applying
-        the sigmoid. For noise values (range [0.0, 1.0]) this should be set
+    add : number, optional
+        This value will be added to the results of `other_param` before applying
+        the sigmoid. For noise values (range ``[0.0, 1.0]``) this should be set
         to about -10.0, provided `mul` was set to 20.
 
     Examples
@@ -2002,34 +2153,16 @@ class Sigmoid(StochasticParameter):
 
     Applies a sigmoid to simplex noise in 50 percent of all calls. The noise
     results are modified to match the sigmoid's expected value range. The
-    sigmoid's outputs are in the range [0.0, 1.0].
+    sigmoid's outputs are in the range ``[0.0, 1.0]``.
 
     """
     def __init__(self, other_param, threshold=(-10, 10), activated=True, mul=1, add=0):
+        super(Sigmoid, self).__init__()
         ia.do_assert(isinstance(other_param, StochasticParameter))
         self.other_param = other_param
 
-        if ia.is_single_number(threshold):
-            self.threshold = Deterministic(threshold)
-        elif isinstance(threshold, tuple):
-            ia.do_assert(len(threshold) == 2)
-            ia.do_assert(all([ia.is_single_number(val) for val in threshold]))
-            self.threshold = Uniform(threshold[0], threshold[1])
-        elif ia.is_iterable(threshold):
-            ia.do_assert(len(threshold) > 0)
-            self.threshold = Choice(threshold)
-        elif isinstance(threshold, StochasticParameter):
-            self.threshold = threshold
-        else:
-            raise Exception("Expected threshold to be number or tuple of two numbers or StochasticParameter, got %s." % (type(threshold),))
-
-        if activated in [True, False, 0, 1, 0.0, 1.0]:
-            self.activated = Deterministic(int(activated))
-        elif ia.is_single_number(activated):
-            ia.do_assert(0 <= activated <= 1.0)
-            self.activated = Binomial(activated)
-        else:
-            raise Exception("Expected activated to be boolean or number or StochasticParameter, got %s." % (type(activated),))
+        self.threshold = handle_continuous_param(threshold, "threshold")
+        self.activated = handle_probability_param(activated, "activated")
 
         ia.do_assert(ia.is_single_number(mul))
         ia.do_assert(mul > 0)
@@ -2046,18 +2179,19 @@ class Sigmoid(StochasticParameter):
 
         Parameters
         ----------
-        other_param : StochasticParameter
-            See `Sigmoid`.
+        other_param : imgaug.parameters.StochasticParameter
+            See :func:`imgaug.parameters.Sigmoid.__init__`.
 
-        threshold : number or tuple of two numbers or iterable of numbers or StochasticParameter, optional(default=(-10, 10))
-            See `Sigmoid`.
+        threshold : number or tuple of number or iterable of number or imgaug.parameters.StochasticParameter,\
+                    optional
+            See :func:`imgaug.parameters.Sigmoid.__init__`.
 
-        activated : bool or number, optional(default=True)
-            See `Sigmoid`.
+        activated : bool or number, optional
+            See :func:`imgaug.parameters.Sigmoid.__init__`.
 
         Returns
         -------
-        out : Sigmoid
+        Sigmoid
             A sigmoid adjusted to be used with noise.
 
         """
@@ -2066,6 +2200,8 @@ class Sigmoid(StochasticParameter):
     def _draw_samples(self, size, random_state):
         seed = random_state.randint(0, 10**6)
         result = self.other_param.draw_samples(size, random_state=ia.new_random_state(seed))
+        if result.dtype.kind != "f":
+            result = result.astype(np.float32)
         activated = self.activated.draw_sample(random_state=ia.new_random_state(seed+1))
         threshold = self.threshold.draw_sample(random_state=ia.new_random_state(seed+2))
         if activated > 0.5:
@@ -2087,189 +2223,14 @@ class Sigmoid(StochasticParameter):
         opstr = str(self.other_param)
         return "Sigmoid(%s, %s, %s, %s, %s)" % (opstr, str(self.threshold), str(self.activated), str(self.mul), str(self.add))
 
-"""
-class SimplexNoise(StochasticParameter):
-    def __init__(self, iterations=(1, 3), size_px_max=(2, 16), upscale_method=["linear", "nearest"], aggregation_method=["max", "avg"], sigmoid=0.5, sigmoid_thresh=(-10, 10)):
-        if ia.is_single_integer(iterations):
-            assert 1 <= iterations <= 1000
-            self.iterations = Deterministic(iterations)
-        elif ia.is_iterable(iterations):
-            assert len(iterations) == 2
-            assert all([ia.is_single_integer(val) for val in iterations])
-            assert all([1 <= val <= 10000 for val in iterations])
-            self.iterations = DiscreteUniform(iterations[0], iterations[1])
-        elif ia.is_iterable(iterations):
-            assert len(iterations) > 0
-            assert all([1 <= val <= 10000 for val in iterations])
-            self.iterations = Choice(iterations)
-        elif isinstance(iterations, StochasticParameter):
-            self.iterations = iterations
-        else:
-            raise Exception("Expected iterations to be int or tuple of two ints or StochasticParameter, got %s." % (type(iterations),))
-
-        if ia.is_single_integer(size_px_max):
-            assert 1 <= size_px_max <= 10000
-            self.size_px_max = Deterministic(size_px_max)
-        elif isinstance(size_px_max, tuple):
-            assert len(size_px_max) == 2
-            assert all([ia.is_single_integer(val) for val in size_px_max])
-            assert all([1 <= val <= 10000 for val in size_px_max])
-            self.size_px_max = DiscreteUniform(size_px_max[0], size_px_max[1])
-        elif ia.is_iterable(size_px_max):
-            assert len(size_px_max) > 0
-            assert all([1 <= val <= 10000 for val in size_px_max])
-            self.size_px_max = Choice(size_px_max)
-        elif isinstance(size_px_max, StochasticParameter):
-            self.size_px_max = size_px_max
-        else:
-            raise Exception("Expected size_px_max to be int or tuple of two ints or StochasticParameter, got %s." % (type(size_px_max),))
-
-        if upscale_method == ia.ALL:
-            self.upscale_method = Choice(["nearest", "linear", "area", "cubic"])
-        elif ia.is_string(upscale_method):
-            self.upscale_method = Deterministic(upscale_method)
-        elif isinstance(upscale_method, list):
-            assert len(upscale_method) >= 1
-            assert all([ia.is_string(val) for val in upscale_method])
-            self.upscale_method = Choice(upscale_method)
-        elif isinstance(upscale_method, StochasticParameter):
-            self.upscale_method = upscale_method
-        else:
-            raise Exception("Expected upscale_method to be string or list of strings or StochasticParameter, got %s." % (type(upscale_method),))
-
-        if aggregation_method == ia.ALL:
-            self.aggregation_method = Choice(["min", "max", "avg"])
-        elif ia.is_string(aggregation_method):
-            self.aggregation_method = Deterministic(aggregation_method)
-        elif isinstance(aggregation_method, list):
-            assert len(aggregation_method) >= 1
-            assert all([ia.is_string(val) for val in aggregation_method])
-            self.aggregation_method = Choice(aggregation_method)
-        elif isinstance(aggregation_method, StochasticParameter):
-            self.aggregation_method = aggregation_method
-        else:
-            raise Exception("Expected aggregation_method to be string or list of strings or StochasticParameter, got %s." % (type(aggregation_method),))
-
-        if sigmoid in [True, False, 0, 1, 0.0, 1.0]:
-            self.sigmoid = Deterministic(int(sigmoid))
-        elif ia.is_single_number(sigmoid):
-            assert 0 <= sigmoid <= 1.0
-            self.sigmoid = Binomial(sigmoid)
-        else:
-            raise Exception("Expected sigmoid to be boolean or number or StochasticParameter, got %s." % (type(sigmoid),))
-
-        if ia.is_single_number(sigmoid_thresh):
-            self.sigmoid_thresh = Deterministic(sigmoid_thresh)
-        elif isinstance(sigmoid_thresh, tuple):
-            assert len(sigmoid_thresh) == 2
-            assert all([ia.is_single_number(val) for val in sigmoid_thresh])
-            self.sigmoid_thresh = Uniform(sigmoid_thresh[0], sigmoid_thresh[1])
-        elif ia.is_iterable(sigmoid_thresh):
-            assert len(sigmoid_thresh) > 0
-            self.sigmoid_thresh = Choice(sigmoid_thresh)
-        elif isinstance(sigmoid_thresh, StochasticParameter):
-            self.sigmoid_thresh = sigmoid_thresh
-        else:
-            raise Exception("Expected sigmoid_thresh to be number or tuple of two numbers or StochasticParameter, got %s." % (type(sigmoid_thresh),))
-
-    def _draw_samples(self, size, random_state):
-        assert len(size) == 2, "Expected requested noise to have shape (H, W), got shape %s." % (size,)
-        h, w = size
-        seed = random_state.randint(0, 10**6)
-        aggregation_method = self.aggregation_method.draw_sample(random_state=ia.new_random_state(seed))
-        iterations = self.iterations.draw_sample(random_state=ia.new_random_state(seed+1))
-        upscale_methods = self.upscale_method.draw_samples((iterations,), random_state=ia.new_random_state(seed+2))
-        result = np.zeros((h, w), dtype=np.float32)
-        for i in sm.xrange(iterations):
-            noise_iter = self._draw_samples_iteration(h, w, seed + 10 + i, upscale_methods[i])
-            if aggregation_method == "avg":
-                result += noise_iter
-            elif aggregation_method == "min":
-                if i == 0:
-                    result = noise_iter
-                else:
-                    result = np.minimum(result, noise_iter)
-            else: # self.aggregation_method == "max"
-                if i == 0:
-                    result = noise_iter
-                else:
-                    result = np.maximum(result, noise_iter)
-
-        if aggregation_method == "avg":
-            result = result / iterations
-
-        sigmoid = self.sigmoid.draw_sample(random_state=ia.new_random_state(seed+3))
-        sigmoid_thresh = self.sigmoid_thresh.draw_sample(random_state=ia.new_random_state(seed+4))
-        if sigmoid > 0.5:
-            # yes, threshold must be subtracted here, not added
-            # higher threshold = move threshold of sigmoid towards the right
-            #                  = make it harder to pass the threshold
-            #                  = more 0.0s / less 1.0s
-            # by subtracting a high value, it moves each x towards the left,
-            # leading to more values being left of the threshold, leading
-            # to more 0.0s
-            result = 1 / (1 + np.exp(-(result * 20 - 10 - sigmoid_thresh)))
-
-        #from scipy import misc
-        #misc.imshow((result * 255).astype(np.uint8))
-
-        return result
-
-    def _draw_samples_iteration(self, h, w, seed, upscale_method):
-        maxlen = max(h, w)
-        size_px_max = self.size_px_max.draw_sample(random_state=ia.new_random_state(seed))
-        if maxlen > size_px_max:
-            downscale_factor = size_px_max / maxlen
-            h_small = int(h * downscale_factor)
-            w_small = int(w * downscale_factor)
-        else:
-            h_small = h
-            w_small = w
-
-        # don't go below Hx1 or 1xW
-        h_small = max(h_small, 1)
-        w_small = max(w_small, 1)
-
-        generator = OpenSimplex(seed=seed)
-        noise = np.zeros((h_small, w_small), dtype=np.float32)
-        for y in sm.xrange(h_small):
-            for x in sm.xrange(w_small):
-                noise[y, x] = generator.noise2d(y=y, x=x)
-        noise_0to1 = (noise + 0.5) / 2
-
-        if noise_0to1.shape != (h, w):
-            noise_0to1_uint8 = (noise_0to1 * 255).astype(np.uint8)
-            noise_0to1_3d = np.tile(noise_0to1_uint8[..., np.newaxis], (1, 1, 3))
-            noise_0to1 = ia.imresize_single_image(noise_0to1_3d, (h, w), interpolation=upscale_method)
-            noise_0to1 = (noise_0to1[..., 0] / 255.0).astype(np.float32)
-
-        #from scipy import misc
-        #print(noise_0to1.shape, h_small, w_small, self.size_percent, self.size_px_max, maxlen)
-        #misc.imshow((noise_0to1 * 255).astype(np.uint8))
-
-        return noise_0to1
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __str__(self):
-        return "SimplexNoise(%s, %s, %s, %s, %s, %s, %s)" % (
-            str(self.iterations),
-            str(self.size_px_max),
-            str(self.upscale_method),
-            str(self.aggregation_method),
-            str(self.sigmoid),
-            str(self.sigmoid_thresh)
-        )
-"""
 
 class SimplexNoise(StochasticParameter):
     """
     A parameter that generates simplex noise of varying resolutions.
 
     This parameter expects to sample noise for 2d planes, i.e. for
-    sizes (H, W) and will return a value in the range [0.0, 1.0] per location
-    in that plane.
+    sizes ``(H, W)`` and will return a value in the range ``[0.0, 1.0]``
+    per location in that plane.
 
     The noise is sampled from low resolution planes and
     upscaled to the requested height and width. The size of the low
@@ -2278,23 +2239,23 @@ class SimplexNoise(StochasticParameter):
 
     Parameters
     ----------
-    size_px_max : int or tuple of two int or list of int or StochasticParameter, optional(default=(2, 16))
+    size_px_max : int or tuple of int or list of int or imgaug.parameters.StochasticParameter, optional
         Size in pixels of the low resolution plane.
         A single int will be used as a constant value. A tuple of two
-        ints (a, b) will result in random values sampled from [a..b].
+        ints ``(a, b)`` will result in random values sampled from ``[a..b]``.
         A list of ints will result in random values being sampled from that
         list. A StochasticParameter will be queried once per call
-        to `_draw_samples()`.
+        to :func:`imgaug.parameters.SimplexNoise._draw_samples`.
 
-    upscale_method : string or int or StochasticParameter, optional(default="nearest")
+    upscale_method : str or int or imgaug.parameters.StochasticParameter, optional
         Upsampling/interpolation method to use. This is used after the sampling
         is finished and the low resolution plane has to be upsampled to the
-        requested `size` in `_draw_samples(size, ...)`. The method may be
-        the same as in `imgaug.imresize_many_images()`. Usually `nearest`
-        or `linear` are good choices. `nearest` will result in rectangles
-        with sharp edges and `linear` in rectangles with blurry and round
+        requested `size` in ``_draw_samples(size, ...)``. The method may be
+        the same as in :func:`imgaug.imgaug.imresize_many_images`. Usually ``nearest``
+        or ``linear`` are good choices. ``nearest`` will result in rectangles
+        with sharp edges and ``linear`` in rectangles with blurry and round
         edges. The method may be provided as a StochasticParameter, which
-        will be queried per call to `_draw_samples()`.
+        will be queried per call to ``_draw_samples()``.
 
     Examples
     --------
@@ -2308,22 +2269,8 @@ class SimplexNoise(StochasticParameter):
 
     """
     def __init__(self, size_px_max=(2, 16), upscale_method=["linear", "nearest"]): # pylint: disable=locally-disabled, dangerous-default-value, line-too-long
-        if ia.is_single_integer(size_px_max):
-            ia.do_assert(1 <= size_px_max <= 10000)
-            self.size_px_max = Deterministic(size_px_max)
-        elif isinstance(size_px_max, tuple):
-            ia.do_assert(len(size_px_max) == 2)
-            ia.do_assert(all([ia.is_single_integer(val) for val in size_px_max]))
-            ia.do_assert(all([1 <= val <= 10000 for val in size_px_max]))
-            self.size_px_max = DiscreteUniform(size_px_max[0], size_px_max[1])
-        elif ia.is_iterable(size_px_max):
-            ia.do_assert(len(size_px_max) > 0)
-            ia.do_assert(all([1 <= val <= 10000 for val in size_px_max]))
-            self.size_px_max = Choice(size_px_max)
-        elif isinstance(size_px_max, StochasticParameter):
-            self.size_px_max = size_px_max
-        else:
-            raise Exception("Expected size_px_max to be int or tuple of two ints or StochasticParameter, got %s." % (type(size_px_max),))
+        super(SimplexNoise, self).__init__()
+        self.size_px_max = handle_discrete_param(size_px_max, "size_px_max", value_range=(1, 10000))
 
         if upscale_method == ia.ALL:
             self.upscale_method = Choice(["nearest", "linear", "area", "cubic"])
@@ -2336,7 +2283,8 @@ class SimplexNoise(StochasticParameter):
         elif isinstance(upscale_method, StochasticParameter):
             self.upscale_method = upscale_method
         else:
-            raise Exception("Expected upscale_method to be string or list of strings or StochasticParameter, got %s." % (type(upscale_method),))
+            raise Exception("Expected upscale_method to be string or list of strings or StochasticParameter, "
+                            + "got %s." % (type(upscale_method),))
 
     def _draw_samples(self, size, random_state):
         ia.do_assert(len(size) == 2, "Expected requested noise to have shape (H, W), got shape %s." % (size,))
@@ -2355,7 +2303,7 @@ class SimplexNoise(StochasticParameter):
                     result = noise_iter
                 else:
                     result = np.minimum(result, noise_iter)
-            else: # self.aggregation_method == "max"
+            else:  # self.aggregation_method == "max"
                 if i == 0:
                     result = noise_iter
                 else:
@@ -2386,17 +2334,17 @@ class SimplexNoise(StochasticParameter):
         for y in sm.xrange(h_small):
             for x in sm.xrange(w_small):
                 noise[y, x] = generator.noise2d(y=y, x=x)
-        noise_0to1 = (noise + 0.5) / 2
+        # TODO this was previously (noise+0.5)/2, which was wrong as the noise here is in
+        # range [-1.0, 1.0], but this new normalization might lead to bad masks due to too many
+        # values being significantly above 0.0 instead of being clipped to 0?
+        noise_0to1 = (noise + 1.0) / 2
+        noise_0to1 = np.clip(noise_0to1, 0.0, 1.0)  # this was also added with the fix
 
         if noise_0to1.shape != (h, w):
             noise_0to1_uint8 = (noise_0to1 * 255).astype(np.uint8)
             noise_0to1_3d = np.tile(noise_0to1_uint8[..., np.newaxis], (1, 1, 3))
             noise_0to1 = ia.imresize_single_image(noise_0to1_3d, (h, w), interpolation=upscale_method)
             noise_0to1 = (noise_0to1[..., 0] / 255.0).astype(np.float32)
-
-        #from scipy import misc
-        #print(noise_0to1.shape, h_small, w_small, self.size_percent, self.size_px_max, maxlen)
-        #misc.imshow((noise_0to1 * 255).astype(np.uint8))
 
         return noise_0to1
 
@@ -2409,12 +2357,13 @@ class SimplexNoise(StochasticParameter):
             str(self.upscale_method)
         )
 
+
 class FrequencyNoise(StochasticParameter):
     """
     Parameter to generate noise of varying frequencies.
 
     This parameter expects to sample noise for 2d planes, i.e. for
-    sizes (H, W) and will return a value in the range [0.0, 1.0] per location
+    sizes ``(H, W)`` and will return a value in the range ``[0.0, 1.0]`` per location
     in that plane.
 
     The exponent controls the frequencies and therefore noise patterns.
@@ -2428,41 +2377,45 @@ class FrequencyNoise(StochasticParameter):
 
     Parameters
     ----------
-    exponent : number or tuple of numbers of list of numbers or StochasticParameter, optional(default=(-4, 4))
+    exponent : number or tuple of number or list of number or imgaug.parameters.StochasticParameter, optional
         Exponent to use when scaling in the frequency domain.
         Sane values are in the range -4 (large blobs) to 4 (small patterns).
         To generate cloud-like structures, use roughly -2.
+
             * If number, then that number will be used as the exponent for all
               iterations.
-            * If tuple of two numbers (a, b), then a value will be sampled
-              per iteration from the range [a, b].
+            * If tuple of two numbers ``(a, b)``, then a value will be sampled
+              per iteration from the range ``[a, b]``.
             * If a list of numbers, then a value will be picked per iteration
               at random from that list.
             * If a StochasticParameter, then a value will be sampled from
               that parameter per iteration.
 
-    size_px_max : int or tuple of ints or list of ints or StochasticParameter, optional(default=(4, 16))
+    size_px_max : int or tuple of int or list of int or imgaug.parameters.StochasticParameter, optional
         The frequency noise is generated in a low resolution environment.
         This parameter defines the maximum size of that environment (in
         pixels). The environment is initialized at the same size as the input
         image and then downscaled, so that no side exceeds `size_px_max`
         (aspect ratio is kept).
+
             * If int, then that number will be used as the size for all
               iterations.
-            * If tuple of two ints (a, b), then a value will be sampled
-              per iteration from the discrete range [a..b].
+            * If tuple of two ints ``(a, b)``, then a value will be sampled
+              per iteration from the discrete range ``[a..b]``.
             * If a list of ints, then a value will be picked per iteration at
               random from that list.
             * If a StochasticParameter, then a value will be sampled from
               that parameter per iteration.
 
-    upscale_method : None or ia.ALL or string or list of string or StochasticParameter, optional(default=None)
+    upscale_method : None or imgaug.ALL or str or list of str or imgaug.parameters.StochasticParameter, optional
         After generating the noise maps in low resolution environments, they
         have to be upscaled to the input image size. This parameter controls
-        the upscaling method.
+        the upscaling method. See also :func:`imgaug.imgaug.imresize_many_images` for a
+        description of possible values.
+
             * If None, then either 'nearest' or 'linear' or 'cubic' is picked.
               Most weight is put on linear, followed by cubic.
-            * If ia.ALL, then either 'nearest' or 'linear' or 'area' or 'cubic'
+            * If imgaug.ALL, then either 'nearest' or 'linear' or 'area' or 'cubic'
               is picked per iteration (all same probability).
             * If string, then that value will be used as the method (must be
               'nearest' or 'linear' or 'area' or 'cubic').
@@ -2479,36 +2432,9 @@ class FrequencyNoise(StochasticParameter):
 
     """
     def __init__(self, exponent=(-4, 4), size_px_max=(4, 32), upscale_method=["linear", "nearest"]): # pylint: disable=locally-disabled, dangerous-default-value, line-too-long
-        if ia.is_single_number(exponent):
-            self.exponent = Deterministic(exponent)
-        elif isinstance(exponent, tuple):
-            ia.do_assert(len(exponent) == 2)
-            ia.do_assert(all([ia.is_single_number(val) for val in exponent]))
-            self.exponent = Uniform(exponent[0], exponent[1])
-        elif ia.is_iterable(exponent):
-            ia.do_assert(len(exponent) > 0)
-            self.exponent = Choice(exponent)
-        elif isinstance(exponent, StochasticParameter):
-            self.exponent = exponent
-        else:
-            raise Exception("Expected exponent to be number or tuple of two numbers or StochasticParameter, got %s." % (type(exponent),))
-
-        if ia.is_single_integer(size_px_max):
-            ia.do_assert(1 <= size_px_max <= 10000)
-            self.size_px_max = Deterministic(size_px_max)
-        elif isinstance(size_px_max, tuple):
-            ia.do_assert(len(size_px_max) == 2)
-            ia.do_assert(all([ia.is_single_integer(val) for val in size_px_max]))
-            ia.do_assert(all([1 <= val <= 10000 for val in size_px_max]))
-            self.size_px_max = DiscreteUniform(size_px_max[0], size_px_max[1])
-        elif ia.is_iterable(size_px_max):
-            ia.do_assert(len(size_px_max) > 0)
-            ia.do_assert(all([1 <= val <= 10000 for val in size_px_max]))
-            self.size_px_max = Choice(size_px_max)
-        elif isinstance(size_px_max, StochasticParameter):
-            self.size_px_max = size_px_max
-        else:
-            raise Exception("Expected size_px_max to be int or tuple of two ints or StochasticParameter, got %s." % (type(size_px_max),))
+        super(FrequencyNoise, self).__init__()
+        self.exponent = handle_continuous_param(exponent, "exponent")
+        self.size_px_max = handle_discrete_param(size_px_max, "size_px_max", value_range=(1, 10000))
 
         if upscale_method == ia.ALL:
             self.upscale_method = Choice(["nearest", "linear", "area", "cubic"])
@@ -2521,7 +2447,8 @@ class FrequencyNoise(StochasticParameter):
         elif isinstance(upscale_method, StochasticParameter):
             self.upscale_method = upscale_method
         else:
-            raise Exception("Expected upscale_method to be string or list of strings or StochasticParameter, got %s." % (type(upscale_method),))
+            raise Exception("Expected upscale_method to be string or list of strings or StochasticParameter, "
+                            + "got %s." % (type(upscale_method),))
 
     def _draw_samples(self, size, random_state):
         # code here is similar to:
@@ -2567,26 +2494,6 @@ class FrequencyNoise(StochasticParameter):
         tr = wn_r * scale
         ti = wn_a * scale
 
-        """
-        Fmin = 1
-        Fmax = 64
-        tr = np.zeros(wn_r.shape, dtype=np.float32)
-        ti = np.zeros(wn_r.shape, dtype=np.float32)
-        for i in range(h_small):
-            for j in range(w_small):
-                if i==0 and j==0:
-                    continue
-                f1 = min(i, h_small-i)
-                f2 = min(j, w_small-j)
-                f = np.sqrt(f1**2 + f2**2)
-                #scale = (Fmin <= f <= Fmax) * (f**(2*-2))
-                scale = (f**(2*-2))
-                x = wn_r[i, j] * scale
-                y = wn_a[i, j] * scale
-                tr[i, j] = x
-                ti[i, j] = y
-        """
-
         wn_freqs_mul = np.zeros(tr.shape, dtype=np.complex)
         wn_freqs_mul.real = tr
         wn_freqs_mul.imag = ti
@@ -2610,18 +2517,16 @@ class FrequencyNoise(StochasticParameter):
 
     def _create_distance_matrix(self, size):
         h, w = size
-        def freq(yy, xx):
+
+        def _freq(yy, xx):
             f1 = np.minimum(yy, h-yy)
             f2 = np.minimum(xx, w-xx)
             return np.sqrt(f1**2 + f2**2)
-        return scipy.fromfunction(freq, (h, w))
+
+        return scipy.fromfunction(_freq, (h, w))
 
     def __repr__(self):
         return self.__str__()
 
     def __str__(self):
-        return "FrequencyNoise(%s, %s, %s)" % (
-            str(self.exponent),
-            str(self.size_px_max),
-            str(self.upscale_method)
-        )
+        return "FrequencyNoise(%s, %s, %s)" % (str(self.exponent), str(self.size_px_max), str(self.upscale_method))

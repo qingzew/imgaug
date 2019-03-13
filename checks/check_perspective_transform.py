@@ -1,8 +1,10 @@
 from __future__ import print_function, division
+
+import numpy as np
+
 import imgaug as ia
 from imgaug import augmenters as iaa
-from scipy import misc
-import numpy as np
+
 
 def main():
     image = ia.quokka(size=0.5)
@@ -22,7 +24,7 @@ def main():
     ]
 
     print("original", image.shape)
-    misc.imshow(kps[0].draw_on_image(image))
+    ia.imshow(kps[0].draw_on_image(image))
 
     print("-----------------")
     print("Random aug per image")
@@ -35,20 +37,19 @@ def main():
             kps_aug = aug_det.augment_keypoints(kps)[0]
             img_aug_kps = kps_aug.draw_on_image(img_aug)
             img_aug_kps = np.pad(img_aug_kps, ((1, 1), (1, 1), (0, 0)), mode="constant", constant_values=255)
-            #print(aug.name, img_aug_kps.shape, img_aug_kps.shape[1]/img_aug_kps.shape[0])
             images_aug.append(img_aug_kps)
-            #misc.imshow(img_aug_kps)
         print(aug.name)
-        misc.imshow(ia.draw_grid(images_aug))
+        ia.imshow(ia.draw_grid(images_aug))
 
     print("----------------")
     print("6 channels")
     print("----------------")
     image6 = np.dstack([image, image])
     image6_aug = augs[1].augment_image(image6)
-    misc.imshow(
+    ia.imshow(
         np.hstack([image6_aug[..., 0:3], image6_aug[..., 3:6]])
     )
+
 
 if __name__ == "__main__":
     main()

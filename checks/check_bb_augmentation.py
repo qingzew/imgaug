@@ -1,9 +1,11 @@
 from __future__ import print_function, division
-import imgaug as ia
-from imgaug import augmenters as iaa
+
+import imageio
 import numpy as np
 from skimage import data
-from scipy import misc
+
+import imgaug as ia
+from imgaug import augmenters as iaa
 
 NB_ROWS = 10
 NB_COLS = 10
@@ -13,6 +15,7 @@ BB_X1 = 64
 BB_X2 = WIDTH - 64
 BB_Y1 = 64
 BB_Y2 = HEIGHT - 64
+
 
 def main():
     image = data.astronaut()
@@ -46,8 +49,9 @@ def main():
     image_after = kps_aug.draw_on_image(image_after)
     image_after = bbs_aug.draw_on_image(image_after)
 
-    misc.imshow(np.hstack([image_before, image_after]))
-    misc.imsave("bb_aug.jpg", np.hstack([image_before, image_after]))
+    ia.imshow(np.hstack([image_before, image_after]))
+    imageio.imwrite("bb_aug.jpg", np.hstack([image_before, image_after]))
+
 
 if __name__ == "__main__":
     main()
