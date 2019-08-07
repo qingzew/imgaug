@@ -41,6 +41,12 @@ class Fliplr(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variab
     """
     Flip/mirror input images horizontally.
 
+    .. note ::
+
+        The default value for the probability is ``0.0``.
+        So, to flip *all* input image use ``Fliplr(1.0)`` and *not* just
+        ``Fliplr()``.
+
     dtype support::
 
         * ``uint8``: yes; fully tested
@@ -107,6 +113,17 @@ class Fliplr(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variab
             heatmaps_i.arr_0to1 = arr_flipped
         return heatmaps
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        arrs_flipped = self._augment_images(
+            [segmaps_i.arr for segmaps_i in segmaps],
+            random_state=random_state,
+            parents=parents,
+            hooks=hooks
+        )
+        for segmaps_i, arr_flipped in zip(segmaps, arrs_flipped):
+            segmaps_i.arr = arr_flipped
+        return segmaps
+
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         nb_images = len(keypoints_on_images)
         samples = self.p.draw_samples((nb_images,), random_state=random_state)
@@ -116,8 +133,7 @@ class Fliplr(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variab
             elif samples[i] == 1:
                 width = keypoints_on_image.shape[1]
                 for keypoint in keypoints_on_image.keypoints:
-                    # TODO is this still correct with float keypoints? Seems like the -1 should be dropped
-                    keypoint.x = (width - 1) - keypoint.x
+                    keypoint.x = width - float(keypoint.x)
         return keypoints_on_images
 
     def _augment_polygons(self, polygons_on_images, random_state, parents,
@@ -134,6 +150,12 @@ class Fliplr(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variab
 class Flipud(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variable, line-too-long
     """
     Flip/mirror input images vertically.
+
+    .. note ::
+
+        The default value for the probability is ``0.0``.
+        So, to flip *all* input image use ``Flipud(1.0)`` and *not* just
+        ``Flipud()``.
 
     dtype support::
 
@@ -200,6 +222,17 @@ class Flipud(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variab
             heatmaps_i.arr_0to1 = arr_flipped
         return heatmaps
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        arrs_flipped = self._augment_images(
+            [segmaps_i.arr for segmaps_i in segmaps],
+            random_state=random_state,
+            parents=parents,
+            hooks=hooks
+        )
+        for segmaps_i, arr_flipped in zip(segmaps, arrs_flipped):
+            segmaps_i.arr = arr_flipped
+        return segmaps
+
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         nb_images = len(keypoints_on_images)
         samples = self.p.draw_samples((nb_images,), random_state=random_state)
@@ -209,8 +242,7 @@ class Flipud(meta.Augmenter):  # pylint: disable=locally-disabled, unused-variab
             elif samples[i] == 1:
                 height = keypoints_on_image.shape[0]
                 for keypoint in keypoints_on_image.keypoints:
-                    # TODO is this still correct with float keypoints? seems like the -1 should be dropped
-                    keypoint.y = (height - 1) - keypoint.y
+                    keypoint.y = height - float(keypoint.y)
         return keypoints_on_images
 
     def _augment_polygons(self, polygons_on_images, random_state, parents,

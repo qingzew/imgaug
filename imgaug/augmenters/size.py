@@ -32,7 +32,7 @@ import numpy as np
 import six.moves as sm
 
 from . import meta
-from .. import imgaug as ia
+import imgaug as ia
 from .. import parameters as iap
 
 
@@ -161,10 +161,9 @@ def _handle_position_parameter(position):
         )
 
 
+@ia.deprecated(alt_func="Resize",
+               comment="Resize has the exactly same interface as Scale.")
 def Scale(*args, **kwargs):
-    import warnings
-    warnings.warn(DeprecationWarning("'Scale' is deprecated. Use 'Resize' instead. It has the exactly same interface "
-                                     "(simple renaming)."))
     return Resize(*args, **kwargs)
 
 
@@ -201,8 +200,9 @@ class Resize(meta.Augmenter):
               be queried once per image. The resulting value will be used
               for both height and width.
             * If this is a dictionary, it may contain the keys "height" and
-              "width". Each key may have the same datatypes as above and
-              describes the scaling on x and y-axis. Both axis are sampled
+              "width" or the keys "shorter-side" and "longer-side". Each key may have the
+              same datatypes as above and describes the scaling on x and y-axis
+              or the shorter and longer-axis, respectively. Both axis are sampled
               independently. Additionally, one of the keys may have the value
               "keep-aspect-ratio", which means that the respective side of the
               image will be resized so that the original aspect ratio is kept.
@@ -275,6 +275,11 @@ class Resize(meta.Augmenter):
     resizes all images to a height of 32 pixels and resizes the x-axis
     (width) so that the aspect ratio is maintained.
 
+    >>> aug = iaa.Resize({"shorter-side": 224, "longer-side": "keep-aspect-ratio"})
+
+    resizes all images to a height/width of 224 pixels depending on which axis is shorter
+    and resizes the other axis so that the aspect ratio is maintained.
+
     >>> aug = iaa.Resize({"height": (0.5, 0.75), "width": [16, 32, 64]})
 
     resizes all images to a height of ``H*v``, where ``H`` is the original height
@@ -303,7 +308,7 @@ class Resize(meta.Augmenter):
             elif allow_dict and isinstance(val, dict):
                 if len(val.keys()) == 0:
                     return iap.Deterministic("keep")
-                else:
+                elif any([key in ["height", "width"] for key in val.keys()]):
                     ia.do_assert(all([key in ["height", "width"] for key in val.keys()]))
                     if "height" in val and "width" in val:
                         ia.do_assert(val["height"] != "keep-aspect-ratio" or val["width"] != "keep-aspect-ratio")
@@ -319,6 +324,23 @@ class Resize(meta.Augmenter):
                             entry = iap.Deterministic("keep")
                         size_tuple.append(entry)
                     return tuple(size_tuple)
+                elif any([key in ["shorter-side", "longer-side"] for key in val.keys()]):
+                    ia.do_assert(all([key in ["shorter-side", "longer-side"] for key in val.keys()]))
+                    if "shorter-side" in val and "longer-side" in val:
+                        ia.do_assert(val["shorter-side"] != "keep-aspect-ratio" or val["longer-side"] != "keep-aspect-ratio")
+
+                    size_tuple = []
+                    for k in ["shorter-side", "longer-side"]:
+                        if k in val:
+                            if val[k] == "keep-aspect-ratio" or val[k] == "keep":
+                                entry = iap.Deterministic(val[k])
+                            else:
+                                entry = handle(val[k], False)
+                        else:
+                            entry = iap.Deterministic("keep")
+                        size_tuple.append(entry)
+                    return tuple(size_tuple)
+
             elif isinstance(val, tuple):
                 ia.do_assert(len(val) == 2)
                 ia.do_assert(val[0] > 0 and val[1] > 0)
@@ -337,14 +359,17 @@ class Resize(meta.Augmenter):
                     return iap.Choice(val)
             elif isinstance(val, iap.StochasticParameter):
                 return val
-            else:
-                raise Exception(
-                    "Expected number, tuple of two numbers, list of numbers, dictionary of "
-                    "form {'height': number/tuple/list/'keep-aspect-ratio'/'keep', "
-                    "'width': <analogous>}, or StochasticParameter, got %s." % (type(val),)
-                )
+
+            raise Exception(
+                "Expected number, tuple of two numbers, list of numbers, dictionary of "
+                "form {'height': number/tuple/list/'keep-aspect-ratio'/'keep', "
+                "'width': <analogous>}, dictionary of form {'shorter-side': number/tuple/list"
+                "/'keep-aspect-ratio'/'keep', 'longer-side': <analogous>},"
+                " or StochasticParameter, got %s." % (type(val),)
+            )
 
         self.size = handle(size, True)
+        self.size_order = 'SL' if (isinstance(size, dict) and 'shorter-side' in size) else 'HW'
 
         if interpolation == ia.ALL:
             self.interpolation = iap.Choice(["nearest", "linear", "area", "cubic"])
@@ -363,11 +388,11 @@ class Resize(meta.Augmenter):
     def _augment_images(self, images, random_state, parents, hooks):
         result = []
         nb_images = len(images)
-        samples_h, samples_w, samples_ip = self._draw_samples(nb_images, random_state, do_sample_ip=True)
+        samples_a, samples_b, samples_ip = self._draw_samples(nb_images, random_state, do_sample_ip=True)
         for i in sm.xrange(nb_images):
             image = images[i]
-            sample_h, sample_w, sample_ip = samples_h[i], samples_w[i], samples_ip[i]
-            h, w = self._compute_height_width(image.shape, sample_h, sample_w)
+            sample_a, sample_b, sample_ip = samples_a[i], samples_b[i], samples_ip[i]
+            h, w = self._compute_height_width(image.shape, sample_a, sample_b, self.size_order)
             image_rs = ia.imresize_single_image(image, (h, w), interpolation=sample_ip)
             result.append(image_rs)
 
@@ -381,17 +406,36 @@ class Resize(meta.Augmenter):
     def _augment_heatmaps(self, heatmaps, random_state, parents, hooks):
         result = []
         nb_heatmaps = len(heatmaps)
-        samples_h, samples_w, samples_ip = self._draw_samples(nb_heatmaps, random_state, do_sample_ip=True)
+        samples_a, samples_b, samples_ip = self._draw_samples(nb_heatmaps, random_state, do_sample_ip=True)
         for i in sm.xrange(nb_heatmaps):
             heatmaps_i = heatmaps[i]
-            sample_h, sample_w, sample_ip = samples_h[i], samples_w[i], samples_ip[i]
-            h_img, w_img = self._compute_height_width(heatmaps_i.shape, sample_h, sample_w)
+            sample_a, sample_b, sample_ip = samples_a[i], samples_b[i], samples_ip[i]
+            h_img, w_img = self._compute_height_width(heatmaps_i.shape, sample_a, sample_b, self.size_order)
             h = int(np.round(h_img * (heatmaps_i.arr_0to1.shape[0] / heatmaps_i.shape[0])))
             w = int(np.round(w_img * (heatmaps_i.arr_0to1.shape[1] / heatmaps_i.shape[1])))
             h = max(h, 1)
             w = max(w, 1)
+            # TODO change this to always have cubic or automatic interpolation?
             heatmaps_i_resized = heatmaps_i.resize((h, w), interpolation=sample_ip)
             heatmaps_i_resized.shape = (h_img, w_img) + heatmaps_i.shape[2:]
+            result.append(heatmaps_i_resized)
+
+        return result
+
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        result = []
+        nb_segmaps = len(segmaps)
+        samples_h, samples_w, _ = self._draw_samples(nb_segmaps, random_state, do_sample_ip=False)
+        for i in sm.xrange(nb_segmaps):
+            segmaps_i = segmaps[i]
+            sample_h, sample_w = samples_h[i], samples_w[i]
+            h_img, w_img = self._compute_height_width(segmaps_i.shape, sample_h, sample_w, self.size_order)
+            h = int(np.round(h_img * (segmaps_i.arr.shape[0] / segmaps_i.shape[0])))
+            w = int(np.round(w_img * (segmaps_i.arr.shape[1] / segmaps_i.shape[1])))
+            h = max(h, 1)
+            w = max(w, 1)
+            heatmaps_i_resized = segmaps_i.resize((h, w))
+            heatmaps_i_resized.shape = (h_img, w_img) + segmaps_i.shape[2:]
             result.append(heatmaps_i_resized)
 
         return result
@@ -399,11 +443,11 @@ class Resize(meta.Augmenter):
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         result = []
         nb_images = len(keypoints_on_images)
-        samples_h, samples_w, _samples_ip = self._draw_samples(nb_images, random_state, do_sample_ip=False)
+        samples_a, samples_b, _samples_ip = self._draw_samples(nb_images, random_state, do_sample_ip=False)
         for i in sm.xrange(nb_images):
             keypoints_on_image = keypoints_on_images[i]
-            sample_h, sample_w = samples_h[i], samples_w[i]
-            h, w = self._compute_height_width(keypoints_on_image.shape, sample_h, sample_w)
+            sample_a, sample_b = samples_a[i], samples_b[i]
+            h, w = self._compute_height_width(keypoints_on_image.shape, sample_a, sample_b, self.size_order)
             new_shape = (h, w) + keypoints_on_image.shape[2:]
             keypoints_on_image_rs = keypoints_on_image.on(new_shape)
 
@@ -417,6 +461,7 @@ class Resize(meta.Augmenter):
             polygons_on_images, random_state, parents, hooks)
 
     def _draw_samples(self, nb_images, random_state, do_sample_ip=True):
+        # TODO use SEED_MAX
         seed = random_state.randint(0, 10**6, 1)[0]
         if isinstance(self.size, tuple):
             samples_h = self.size[0].draw_samples(nb_images, random_state=ia.new_random_state(seed + 0))
@@ -431,9 +476,19 @@ class Resize(meta.Augmenter):
         return samples_h, samples_w, samples_ip
 
     @classmethod
-    def _compute_height_width(cls, image_shape, sample_h, sample_w):
+    def _compute_height_width(cls, image_shape, sample_a, sample_b, size_order):
         imh, imw = image_shape[0:2]
-        h, w = sample_h, sample_w
+
+        if size_order == 'SL':
+            # size order: short, long
+            if imh < imw:
+                h, w = sample_a, sample_b
+            else:
+                w, h = sample_a, sample_b
+
+        else:
+            # size order: height, width
+            h, w = sample_a, sample_b
 
         if ia.is_single_float(h):
             ia.do_assert(0 < h)
@@ -461,15 +516,21 @@ class Resize(meta.Augmenter):
         return h, w
 
     def get_parameters(self):
-        return [self.size, self.interpolation]
+        return [self.size, self.interpolation, self.size_order]
 
 
 class CropAndPad(meta.Augmenter):
     """
-    Augmenter that crops/pads images by defined amounts in pixels or
-    percent (relative to input image size).
+    Crop/pad images by pixel amounts or fractions of image sizes.
+
     Cropping removes pixels at the sides (i.e. extracts a subimage from
     a given full image). Padding adds pixels to the sides (e.g. black pixels).
+
+    .. note ::
+
+        This augmenter automatically resizes images back to their original size
+        after it has augmented them. To deactivate this, add the
+        parameter ``keep_size=False``.
 
     dtype support::
 
@@ -810,6 +871,7 @@ class CropAndPad(meta.Augmenter):
     def _augment_heatmaps(self, heatmaps, random_state, parents, hooks):
         result = []
         nb_heatmaps = len(heatmaps)
+        # TODO use SEED_MAX
         seeds = random_state.randint(0, 10**6, (nb_heatmaps,))
         for i in sm.xrange(nb_heatmaps):
             seed = seeds[i]
@@ -848,6 +910,7 @@ class CropAndPad(meta.Augmenter):
 
             arr_cr = heatmaps[i].arr_0to1[crop_top:height_heatmaps-crop_bottom, crop_left:width_heatmaps-crop_right, :]
 
+            # TODO switch to ia.pad()
             if any([pad_top > 0, pad_right > 0, pad_bottom > 0, pad_left > 0]):
                 if arr_cr.ndim == 2:
                     pad_vals = ((pad_top, pad_bottom), (pad_left, pad_right))
@@ -869,6 +932,73 @@ class CropAndPad(meta.Augmenter):
                 ) + heatmaps[i].shape[2:]
 
             result.append(heatmaps[i])
+
+        return result
+
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        result = []
+        nb_segmaps = len(segmaps)
+        # TODO use SEED_MAX
+        seeds = random_state.randint(0, 10**6, (nb_segmaps,))
+        for i in sm.xrange(nb_segmaps):
+            seed = seeds[i]
+            height_image, width_image = segmaps[i].shape[0:2]
+            height_segmaps, width_segmaps = segmaps[i].arr.shape[0:2]
+
+            vals = self._draw_samples_image(seed, height_image, width_image)
+            crop_image_top, crop_image_right, crop_image_bottom, crop_image_left, \
+                pad_image_top, pad_image_right, pad_image_bottom, pad_image_left, \
+                _pad_mode, _pad_cval = vals
+
+            if (height_image, width_image) != (height_segmaps, width_segmaps):
+                crop_top = int(np.round(height_segmaps * (crop_image_top/height_image)))
+                crop_right = int(np.round(width_segmaps * (crop_image_right/width_image)))
+                crop_bottom = int(np.round(height_segmaps * (crop_image_bottom/height_image)))
+                crop_left = int(np.round(width_segmaps * (crop_image_left/width_image)))
+
+                crop_top, crop_right, crop_bottom, crop_left = \
+                    _crop_prevent_zero_size(height_segmaps, width_segmaps,
+                                            crop_top, crop_right, crop_bottom, crop_left)
+
+                pad_top = int(np.round(height_segmaps * (pad_image_top/height_image)))
+                pad_right = int(np.round(width_segmaps * (pad_image_right/width_image)))
+                pad_bottom = int(np.round(height_segmaps * (pad_image_bottom/height_image)))
+                pad_left = int(np.round(width_segmaps * (pad_image_left/width_image)))
+            else:
+                crop_top = crop_image_top
+                crop_right = crop_image_right
+                crop_bottom = crop_image_bottom
+                crop_left = crop_image_left
+
+                pad_top = pad_image_top
+                pad_right = pad_image_right
+                pad_bottom = pad_image_bottom
+                pad_left = pad_image_left
+
+            arr_cr = segmaps[i].arr[crop_top:height_segmaps - crop_bottom, crop_left:width_segmaps - crop_right, :]
+
+            # TODO switch to ia.pad()
+            if any([pad_top > 0, pad_right > 0, pad_bottom > 0, pad_left > 0]):
+                if arr_cr.ndim == 2:
+                    pad_vals = ((pad_top, pad_bottom), (pad_left, pad_right))
+                else:
+                    pad_vals = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0))
+
+                arr_cr_pa = np.pad(arr_cr, pad_vals, mode="constant", constant_values=0)
+            else:
+                arr_cr_pa = arr_cr
+
+            segmaps[i].arr = arr_cr_pa
+
+            if self.keep_size:
+                segmaps[i] = segmaps[i].resize((height_segmaps, width_segmaps))
+            else:
+                segmaps[i].shape = (
+                   segmaps[i].shape[0] - crop_image_top - crop_image_bottom + pad_image_top + pad_image_bottom,
+                   segmaps[i].shape[1] - crop_image_left - crop_image_right + pad_image_left + pad_image_right
+                ) + segmaps[i].shape[2:]
+
+            result.append(segmaps[i])
 
         return result
 
@@ -959,7 +1089,7 @@ class CropAndPad(meta.Augmenter):
 def Pad(px=None, percent=None, pad_mode="constant", pad_cval=0, keep_size=True, sample_independently=True,
         name=None, deterministic=False, random_state=None):
     """
-    Augmenter that pads images, i.e. adds columns/rows to them.
+    Pad images, i.e. adds columns/rows of pixels to them.
 
     dtype support::
 
@@ -1158,7 +1288,7 @@ def Pad(px=None, percent=None, pad_mode="constant", pad_cval=0, keep_size=True, 
 def Crop(px=None, percent=None, keep_size=True, sample_independently=True,
          name=None, deterministic=False, random_state=None):
     """
-    Augmenter that crops/cuts away pixels at the sides of the image.
+    Crop images, i.e. remove columns/rows of pixels at the sides of images.
 
     That allows to cut out subimages from given (full) input images.
     The number of pixels to cut off may be defined in absolute values or
@@ -1307,18 +1437,22 @@ def Crop(px=None, percent=None, keep_size=True, sample_independently=True,
 # TODO maybe rename this to PadToMinimumSize?
 # TODO this is very similar to CropAndPad, maybe add a way to generate crop values imagewise via a callback in
 #      in CropAndPad?
+# TODO why is padding mode and cval here called pad_mode, pad_cval but in other
+#      cases mode/cval?
 class PadToFixedSize(meta.Augmenter):
     """
     Pad images to minimum width/height.
 
-    If images are already at the minimum width/height or are larger, they will not be padded.
-    Note: This also means that images will not be cropped if they exceed the required width/height.
+    If images are already at the minimum width/height or are larger, they will
+    not be padded. Note that this also means that images will not be cropped if
+    they exceed the required width/height.
 
-    The augmenter randomly decides per image how to distribute the required padding amounts
-    over the image axis. E.g. if 2px have to be padded on the left or right to reach the
-    required width, the augmenter will sometimes add 2px to the left and 0px to the right,
-    sometimes add 2px to the right and 0px to the left and sometimes add 1px to both sides.
-    Set `position` to ``center`` to prevent that.
+    The augmenter randomly decides per image how to distribute the required
+    padding amounts over the image axis. E.g. if 2px have to be padded on the
+    left or right to reach the required width, the augmenter will sometimes
+    add 2px to the left and 0px to the right, sometimes add 2px to the right
+    and 0px to the left and sometimes add 1px to both sides. Set `position`
+    to ``center`` to prevent that.
 
     dtype support::
 
@@ -1379,24 +1513,36 @@ class PadToFixedSize(meta.Augmenter):
 
     Examples
     --------
+    >>> import imgaug.augmenters as iaa
     >>> aug = iaa.PadToFixedSize(width=100, height=100)
 
-    For edges smaller than 100 pixels, pads to 100 pixels. Does nothing for the other edges.
-    The padding is randomly (uniformly) distributed over the sides, so that e.g. sometimes most of the required padding
-    is applied to the left, sometimes to the right (analogous top/bottom).
+    For image sides smaller than ``100`` pixels, pad to ``100`` pixels. Do
+    nothing for the other edges. The padding is randomly (uniformly)
+    distributed over the sides, so that e.g. sometimes most of the required
+    padding is applied to the left, sometimes to the right (analogous
+    top/bottom).
 
     >>> aug = iaa.PadToFixedSize(width=100, height=100, position="center")
 
-    For edges smaller than 100 pixels, pads to 100 pixels. Does nothing for the other edges.
-    The padding is always equally distributed over the left/right and top/bottom sides.
+    For image sides smaller than ``100`` pixels, pad to ``100`` pixels. Do
+    nothing for the other image sides. The padding is always equally
+    distributed over the left/right and top/bottom sides.
+
+    >>> aug = iaa.PadToFixedSize(width=100, height=100, pad_mode=ia.ALL)
+
+    For image sides smaller than ``100`` pixels, pad to ``100`` pixels and
+    use any possible padding mode for that. Do nothing for the other image
+    sides. The padding is always equally distributed over the left/right and
+    top/bottom sides.
 
     >>> aug = iaa.Sequential([
     >>>     iaa.PadToFixedSize(width=100, height=100),
     >>>     iaa.CropToFixedSize(width=100, height=100)
     >>> ])
 
-    Pads to ``100x100`` pixel for smaller images, and crops to ``100x100`` pixel for larger images.
-    The output images have fixed size, ``100x100`` pixel.
+    Pad images smaller than ``100x100`` until they reach ``100x100``.
+    Analogously, crop images larger than ``100x100`` until they reach
+    ``100x100``. The output images therefore have a fixed size of ``100x100``.
 
     """
 
@@ -1492,6 +1638,43 @@ class PadToFixedSize(meta.Augmenter):
 
         return heatmaps
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        nb_images = len(segmaps)
+        w, h = self.size
+        pad_xs, pad_ys, _pad_modes, _pad_cvals = self._draw_samples(nb_images, random_state)
+        for i in sm.xrange(nb_images):
+            height_image, width_image = segmaps[i].shape[:2]
+            pad_image_left, pad_image_right, pad_image_top, pad_image_bottom = \
+                self._calculate_paddings(h, w, height_image, width_image, pad_xs[i], pad_ys[i])
+            height_segmaps, width_segmaps = segmaps[i].arr.shape[0:2]
+
+            # TODO for 30x30 padded to 32x32 with 15x15 heatmaps this results in paddings of 1 on
+            # each side (assuming position=(0.5, 0.5)) giving 17x17 heatmaps when they should be
+            # 16x16. Error is due to each side getting projected 0.5 padding which is rounded to 1.
+            # This doesn't seem right.
+            if (height_image, width_image) != (height_segmaps, width_segmaps):
+                pad_top = int(np.round(height_segmaps * (pad_image_top/height_image)))
+                pad_right = int(np.round(width_segmaps * (pad_image_right/width_image)))
+                pad_bottom = int(np.round(height_segmaps * (pad_image_bottom/height_image)))
+                pad_left = int(np.round(width_segmaps * (pad_image_left/width_image)))
+            else:
+                pad_top = pad_image_top
+                pad_right = pad_image_right
+                pad_bottom = pad_image_bottom
+                pad_left = pad_image_left
+
+            segmaps[i].arr = ia.pad(
+                segmaps[i].arr,
+                top=pad_top, right=pad_right, bottom=pad_bottom, left=pad_left,
+                mode="constant", cval=0
+            )
+            segmaps[i].shape = (
+                height_image + pad_image_top + pad_image_bottom,
+                width_image + pad_image_left + pad_image_right
+            ) + segmaps[i].shape[2:]
+
+        return segmaps
+
     def _augment_polygons(self, polygons_on_images, random_state, parents,
                           hooks):
         return self._augment_polygons_as_keypoints(
@@ -1538,16 +1721,18 @@ class PadToFixedSize(meta.Augmenter):
 # TODO add crop() function in imgaug, similar to pad
 class CropToFixedSize(meta.Augmenter):
     """
-    Augmenter that crops down to a fixed maximum width/height.
+    Crop images down to a fixed maximum width/height.
 
-    If images are already at the maximum width/height or are smaller, they will not be cropped.
-    Note: This also means that images will not be padded if they are below the required width/height.
+    If images are already at the maximum width/height or are smaller, they
+    will not be cropped. Note that this also means that images will not be
+    padded if they are below the required width/height.
 
-    The augmenter randomly decides per image how to distribute the required cropping amounts
-    over the image axis. E.g. if 2px have to be cropped on the left or right to reach the
-    required width, the augmenter will sometimes remove 2px from the left and 0px from the right,
-    sometimes remove 2px from the right and 0px from the left and sometimes remove 1px from both
-    sides. Set `position` to ``center`` to prevent that.
+    The augmenter randomly decides per image how to distribute the required
+    cropping amounts over the image axis. E.g. if 2px have to be cropped on
+    the left or right to reach the required width, the augmenter will
+    sometimes remove 2px from the left and 0px from the right, sometimes
+    remove 2px from the right and 0px from the left and sometimes remove 1px
+    from both sides. Set `position` to ``center`` to prevent that.
 
     dtype support::
 
@@ -1613,24 +1798,27 @@ class CropToFixedSize(meta.Augmenter):
 
     Examples
     --------
+    >>> import imgaug.augmenters as iaa
     >>> aug = iaa.CropToFixedSize(width=100, height=100)
 
-    For sides larger than 100 pixels, crops to 100 pixels. Does nothing for the other sides.
-    The cropping amounts are randomly (and uniformly) distributed over the sides of the image.
+    For image sides larger than ``100`` pixels, crop to ``100`` pixels. Do
+    nothing for the other sides. The cropping amounts are randomly (and
+    uniformly) distributed over the sides of the image.
 
     >>> aug = iaa.CropToFixedSize(width=100, height=100, position="center")
 
-    For sides larger than 100 pixels, crops to 100 pixels. Does nothing for the other sides.
-    The cropping amounts are always equally distributed over the left/right sides of the image (and analogously
-    for top/bottom).
+    For sides larger than ``100`` pixels, crop to ``100`` pixels. Do nothing
+    for the other sides. The cropping amounts are always equally distributed
+    over the left/right sides of the image (and analogously for top/bottom).
 
     >>> aug = iaa.Sequential([
     >>>     iaa.PadToFixedSize(width=100, height=100),
     >>>     iaa.CropToFixedSize(width=100, height=100)
     >>> ])
 
-    pads to ``100x100`` pixel for smaller images, and crops to ``100x100`` pixel for larger images.
-    The output images have fixed size, ``100x100`` pixel.
+    Pad images smaller than ``100x100`` until they reach ``100x100``.
+    Analogously, crop images larger than ``100x100`` until they reach
+    ``100x100``. The output images therefore have a fixed size of ``100x100``.
 
     """
 
@@ -1756,6 +1944,51 @@ class CropToFixedSize(meta.Augmenter):
 
         return heatmaps
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        nb_images = len(segmaps)
+        w, h = self.size
+        offset_xs, offset_ys = self._draw_samples(nb_images, random_state)
+        for i in sm.xrange(nb_images):
+            height_image, width_image = segmaps[i].shape[0:2]
+            height_segmaps, width_segmaps = segmaps[i].arr.shape[0:2]
+
+            crop_image_top, crop_image_bottom = 0, 0
+            crop_image_left, crop_image_right = 0, 0
+
+            if height_image > h:
+                crop_image_top = int(offset_ys[i] * (height_image - h))
+                crop_image_bottom = height_image - h - crop_image_top
+
+            if width_image > w:
+                crop_image_left = int(offset_xs[i] * (width_image - w))
+                crop_image_right = width_image - w - crop_image_left
+
+            if (height_image, width_image) != (height_segmaps, width_segmaps):
+                crop_top = int(np.round(height_segmaps * (crop_image_top/height_image)))
+                crop_right = int(np.round(width_segmaps * (crop_image_right/width_image)))
+                crop_bottom = int(np.round(height_segmaps * (crop_image_bottom/height_image)))
+                crop_left = int(np.round(width_segmaps * (crop_image_left/width_image)))
+
+                # TODO add test for zero-size prevention
+                crop_top, crop_right, crop_bottom, crop_left = _crop_prevent_zero_size(
+                    height_segmaps, width_segmaps, crop_top, crop_right, crop_bottom, crop_left)
+            else:
+                crop_top = crop_image_top
+                crop_right = crop_image_right
+                crop_bottom = crop_image_bottom
+                crop_left = crop_image_left
+
+            segmaps[i].arr = segmaps[i].arr[crop_top:height_segmaps - crop_bottom,
+                                            crop_left:width_segmaps-crop_right,
+                                            :]
+
+            segmaps[i].shape = (
+                segmaps[i].shape[0] - crop_image_top - crop_image_bottom,
+                segmaps[i].shape[1] - crop_image_left - crop_image_right
+            ) + segmaps[i].shape[2:]
+
+        return segmaps
+
     def _draw_samples(self, nb_images, random_state):
         seed = random_state.randint(0, 10**6, 1)[0]
 
@@ -1778,10 +2011,14 @@ class CropToFixedSize(meta.Augmenter):
 
 class KeepSizeByResize(meta.Augmenter):
     """
-    Augmenter that resizes images before/after augmentation so that they retain their original height and width.
+    Resize images back to their input sizes after applying child augmenters.
 
-    This can e.g. be placed after a cropping operation. Some augmenters have a ``keep_size`` parameter that does
-    mostly the same if set to True, though this augmenter offers control over the interpolation mode.
+    Combining this with e.g. a cropping augmenter as the child will lead to
+    images being resized back to the input size after the crop operation was
+    applied. Some augmenters have a ``keep_size`` argument that achieves the
+    same goal (if set to ``True``), though this augmenter offers control over
+    the interpolation mode and which augmentables to resize (images, heatmaps,
+    segmentation maps).
 
     dtype support::
 
@@ -1818,6 +2055,15 @@ class KeepSizeByResize(meta.Augmenter):
         corresponding images. The value may also be returned on a per-image basis if `interpolation_heatmaps` is
         provided as a StochasticParameter or may be one possible value if it is provided as a list of strings.
 
+    interpolation_segmaps : KeepSizeByResize.SAME_AS_IMAGES or KeepSizeByResize.NO_RESIZE or\
+                            {'nearest', 'linear', 'area', 'cubic'} or\
+                            {cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_AREA, cv2.INTER_CUBIC} or\
+                            list of str or list of int or StochasticParameter, optional
+        The interpolation mode to use when resizing segmentation maps.
+        Similar to `interpolation_heatmaps`.
+        NOTE: Only ``NO_RESIZE`` or nearest neighbour interpolation make sense
+        in the vast majority of all cases.
+
     name : None or str, optional
         See :func:`imgaug.augmenters.meta.Augmenter.__init__`.
 
@@ -1827,12 +2073,47 @@ class KeepSizeByResize(meta.Augmenter):
     random_state : None or int or numpy.random.RandomState, optional
         See :func:`imgaug.augmenters.meta.Augmenter.__init__`.
 
+    Examples
+    --------
+    >>> import imgaug.augmenters as iaa
+    >>> aug = iaa.KeepSizeByResize(
+    >>>     iaa.Crop((20, 40), keep_size=False)
+    >>> )
+
+    Apply random cropping to input images, then resize them back to their
+    original input sizes. The resizing is done using this augmenter instead
+    of the corresponding internal resizing operation in ``Crop``.
+
+    >>> aug = iaa.KeepSizeByResize(
+    >>>     iaa.Crop((20, 40), keep_size=False),
+    >>>     interpolation="nearest"
+    >>> )
+
+    Same as in the previous example, but images are now always resized using
+    nearest neighbour interpolation.
+
+    >>> aug = iaa.KeepSizeByResize(
+    >>>     iaa.Crop((20, 40), keep_size=False),
+    >>>     interpolation=["nearest", "cubic"],
+    >>>     interpolation_heatmaps=iaa.KeepSizeByResize.SAME_AS_IMAGES,
+    >>>     interpolation_segmaps=iaa.KeepSizeByResize.NO_RESIZE
+    >>> )
+
+    Similar to the previous example, but images are now sometimes resized
+    using linear interpolation and sometimes using nearest neighbour
+    interpolation. Heatmaps are resized using the same interpolation as was
+    used for the corresponding image. Segmentation maps are not resized and
+    will therefore remain at their size after cropping.
+
     """
 
     NO_RESIZE = "NO_RESIZE"
     SAME_AS_IMAGES = "SAME_AS_IMAGES"
 
-    def __init__(self, children, interpolation="cubic", interpolation_heatmaps=SAME_AS_IMAGES,
+    def __init__(self, children,
+                 interpolation="cubic",
+                 interpolation_heatmaps=SAME_AS_IMAGES,
+                 interpolation_segmaps="nearest",
                  name=None, deterministic=False, random_state=None):
         super(KeepSizeByResize, self).__init__(name=name, deterministic=deterministic, random_state=random_state)
         self.children = children
@@ -1864,12 +2145,12 @@ class KeepSizeByResize(meta.Augmenter):
         self.children = meta.handle_children_list(children, self.name, "then")
         self.interpolation = _validate_param(interpolation, False)
         self.interpolation_heatmaps = _validate_param(interpolation_heatmaps, True)
+        self.interpolation_segmaps = _validate_param(interpolation_segmaps, True)
 
-    def _draw_samples(self, nb_images, random_state, return_heatmaps):
+    def _draw_samples(self, nb_images, random_state):
+        # TODO use SEED_MAX
         seed = random_state.randint(0, 10 ** 6, 1)[0]
         interpolations = self.interpolation.draw_samples((nb_images,), random_state=ia.new_random_state(seed + 0))
-        if not return_heatmaps:
-            return interpolations
 
         if self.interpolation_heatmaps == KeepSizeByResize.SAME_AS_IMAGES:
             interpolations_heatmaps = np.copy(interpolations)
@@ -1878,19 +2159,39 @@ class KeepSizeByResize(meta.Augmenter):
                 (nb_images,), random_state=ia.new_random_state(seed + 10)
             )
 
-            # Note that `interpolations_heatmaps == self.SAME_AS_IMAGES` works here only if the datatype of the array
-            # is such that it may contain strings. It does not work properly for e.g. integer arrays and will produce
-            # a single bool output, even for arrays with more than one entry.
-            same_as_imgs_idx = [ip == self.SAME_AS_IMAGES for ip in interpolations_heatmaps]
+            # Note that `interpolations_heatmaps == self.SAME_AS_IMAGES`
+            # works here only if the datatype of the array is such that it
+            # may contain strings. It does not work properly for e.g.
+            # integer arrays and will produce a single bool output, even
+            # for arrays with more than one entry.
+            same_as_imgs_idx = [ip == self.SAME_AS_IMAGES
+                                for ip in interpolations_heatmaps]
 
             interpolations_heatmaps[same_as_imgs_idx] = interpolations[same_as_imgs_idx]
 
-        return interpolations, interpolations_heatmaps
+        if self.interpolation_segmaps == KeepSizeByResize.SAME_AS_IMAGES:
+            interpolations_segmaps = np.copy(interpolations)
+        else:
+            interpolations_segmaps = self.interpolation_segmaps.draw_samples(
+                (nb_images,), random_state=ia.new_random_state(seed + 10)
+            )
+
+            # Note that `interpolations_heatmaps == self.SAME_AS_IMAGES`
+            # works here only if the datatype of the array is such that it
+            # may contain strings. It does not work properly for e.g.
+            # integer arrays and will produce a single bool output, even
+            # for arrays with more than one entry.
+            same_as_imgs_idx = [ip == self.SAME_AS_IMAGES
+                                for ip in interpolations_segmaps]
+
+            interpolations_segmaps[same_as_imgs_idx] = interpolations[same_as_imgs_idx]
+
+        return interpolations, interpolations_heatmaps, interpolations_segmaps
 
     def _augment_images(self, images, random_state, parents, hooks):
         input_was_array = ia.is_np_array(images)
         if hooks is None or hooks.is_propagating(images, augmenter=self, parents=parents, default=True):
-            interpolations = self._draw_samples(len(images), random_state, return_heatmaps=False)
+            interpolations, _, _ = self._draw_samples(len(images), random_state)
             input_shapes = [image.shape[0:2] for image in images]
 
             images_aug = self.children.augment_images(
@@ -1919,7 +2220,7 @@ class KeepSizeByResize(meta.Augmenter):
     def _augment_heatmaps(self, heatmaps, random_state, parents, hooks):
         if hooks is None or hooks.is_propagating(heatmaps, augmenter=self, parents=parents, default=True):
             nb_heatmaps = len(heatmaps)
-            _, interpolations_heatmaps = self._draw_samples(nb_heatmaps, random_state, return_heatmaps=True)
+            _, interpolations_heatmaps, _ = self._draw_samples(nb_heatmaps, random_state)
             input_arr_shapes = [heatmaps_i.arr_0to1.shape for heatmaps_i in heatmaps]
 
             # augment according to if and else list
@@ -1943,9 +2244,36 @@ class KeepSizeByResize(meta.Augmenter):
 
         return result
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        if hooks is None or hooks.is_propagating(segmaps, augmenter=self, parents=parents, default=True):
+            nb_segmaps = len(segmaps)
+            _, _, interpolations_segmaps = self._draw_samples(nb_segmaps, random_state)
+            input_arr_shapes = [segmaps_i.arr.shape for segmaps_i in segmaps]
+
+            # augment according to if and else list
+            segmaps_aug = self.children.augment_segmentation_maps(
+                segmaps,
+                parents=parents + [self],
+                hooks=hooks
+            )
+
+            result = []
+            gen = zip(segmaps, segmaps_aug, interpolations_segmaps, input_arr_shapes)
+            for segmaps, segmaps_aug, interpolation, input_arr_shape in gen:
+                if interpolation == "NO_RESIZE":
+                    result.append(segmaps_aug)
+                else:
+                    segmaps_aug = segmaps_aug.resize(input_arr_shape[0:2], interpolation=interpolation)
+                    segmaps_aug.shape = segmaps.shape
+                    result.append(segmaps_aug)
+        else:
+            result = segmaps
+
+        return result
+
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         if hooks is None or hooks.is_propagating(keypoints_on_images, augmenter=self, parents=parents, default=True):
-            interpolations = self._draw_samples(len(keypoints_on_images), random_state, return_heatmaps=False)
+            interpolations, _, _ = self._draw_samples(len(keypoints_on_images), random_state)
             input_shapes = [kpsoi_i.shape for kpsoi_i in keypoints_on_images]
 
             # augment according to if and else list

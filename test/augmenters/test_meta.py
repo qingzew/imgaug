@@ -26,6 +26,9 @@ from imgaug import parameters as iap
 from imgaug import dtypes as iadt
 from imgaug.augmenters import meta
 from imgaug.testutils import create_random_images, create_random_keypoints, array_equal_lists, keypoints_equal, reseed
+from imgaug.augmentables.heatmaps import HeatmapsOnImage
+from imgaug.augmentables.segmaps import SegmentationMapsOnImage
+from imgaug.augmentables.lines import LineString, LineStringsOnImage
 
 
 def main():
@@ -38,17 +41,22 @@ def main():
     test_reduce_to_nonempty()
     test_invert_reduce_to_nonempty()
     test_Augmenter()
+    test_Augmenter_augment_batches()
     test_Augmenter_augment_heatmaps()
     test_Augmenter_augment_keypoints()
     test_Augmenter_augment_bounding_boxes()
     test_Augmenter_augment_polygons()
+    test_Augmenter_augment_line_strings()
     test_Augmenter_augment_segmentation_maps()
+    test_Augmenter_augment()
+    test_Augmenter_augment_py36_or_higher()
+    test_Augmenter_augment_py35_or_lower()
+    test_Augmenter___call__()
+    test_Augmenter_pool()
     test_Augmenter_find()
     test_Augmenter_remove()
     test_Augmenter_hooks()
     test_Augmenter_copy_random_state()
-    test_Augmenter_augment_batches()
-    test_Augmenter_pool()
     test_Sequential()
     test_SomeOf()
     test_OneOf()
@@ -69,9 +77,21 @@ def test_Noop():
     reseed()
 
     images = create_random_images((16, 70, 50, 3))
+    heatmaps = HeatmapsOnImage(
+        np.linspace(0.0, 1.0, 2*2).reshape((2, 2, 1)).astype(np.float32),
+        shape=(2, 2, 3)
+    )
+    segmaps = SegmentationMapsOnImage(
+        np.arange(2*2).reshape((2, 2, 1)).astype(np.int32),
+        shape=(2, 2, 3)
+    )
     keypoints = create_random_keypoints((16, 70, 50, 3), 4)
     psoi = ia.PolygonsOnImage(
         [ia.Polygon([(10, 10), (30, 10), (30, 50), (10, 50)])],
+        shape=images[0].shape
+    )
+    lsoi = LineStringsOnImage(
+        [LineString([(10, 10), (30, 10), (30, 50), (10, 50)])],
         shape=images[0].shape
     )
 
@@ -86,6 +106,21 @@ def test_Noop():
     expected = images
     assert np.array_equal(observed, expected)
 
+    # heatmaps
+    observed = aug.augment_heatmaps(heatmaps)
+    assert np.allclose(observed.arr_0to1, heatmaps.arr_0to1)
+
+    observed = aug_det.augment_heatmaps(heatmaps)
+    assert np.allclose(observed.arr_0to1, heatmaps.arr_0to1)
+
+    # segmaps
+    observed = aug.augment_segmentation_maps(segmaps)
+    assert np.array_equal(observed.arr, segmaps.arr)
+
+    observed = aug_det.augment_segmentation_maps(segmaps)
+    assert np.array_equal(observed.arr, segmaps.arr)
+
+    # keypoints
     observed = aug.augment_keypoints(keypoints)
     expected = keypoints
     assert keypoints_equal(observed, expected)
@@ -94,6 +129,7 @@ def test_Noop():
     expected = keypoints
     assert keypoints_equal(observed, expected)
 
+    # polygons
     observed = aug.augment_polygons(psoi)
     assert observed.shape == psoi.shape
     assert len(observed.polygons) == 1
@@ -104,12 +140,22 @@ def test_Noop():
     assert len(observed.polygons) == 1
     assert np.allclose(observed.polygons[0].exterior, psoi.polygons[0].exterior)
 
-    # test empty keypoints
+    # line strings
+    observed = aug.augment_line_strings(lsoi)
+    assert observed.shape == lsoi.shape
+    assert len(observed.line_strings) == 1
+
+    observed = aug_det.augment_line_strings(lsoi)
+    assert observed.shape == lsoi.shape
+    assert len(observed.line_strings) == 1
+    assert observed.line_strings[0].coords_almost_equals(lsoi.line_strings[0])
+
+    # empty keypoints
     observed = aug.augment_keypoints(ia.KeypointsOnImage([], shape=(4, 5, 3)))
     assert observed.shape == (4, 5, 3)
     assert len(observed.keypoints) == 0
 
-    # test empty polygons
+    # empty polygons
     observed = aug.augment_polygons(ia.PolygonsOnImage([], shape=(4, 5, 3)))
     assert observed.shape == (4, 5, 3)
     assert len(observed.polygons) == 0
@@ -166,6 +212,14 @@ def test_Lambda():
                                    [0.0, 1.0, 1.0]])
     heatmaps = ia.HeatmapsOnImage(heatmaps_arr, shape=(3, 3, 3))
 
+    segmaps_arr = np.int32([[0, 0, 1],
+                            [0, 0, 1],
+                            [0, 1, 1]])
+    segmaps_arr_aug = np.int32([[1, 1, 2],
+                                [1, 1, 2],
+                                [1, 2, 2]])
+    segmaps = SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))
+
     keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=0, y=0), ia.Keypoint(x=1, y=1),
                                       ia.Keypoint(x=2, y=2)], shape=base_img.shape)]
     keypoints_aug = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0), ia.Keypoint(x=2, y=1),
@@ -191,6 +245,10 @@ def test_Lambda():
         heatmaps[0].arr_0to1[0, 0] += 0.5
         return heatmaps
 
+    def func_segmaps(segmaps, random_state, parents, hooks):
+        segmaps[0].arr += 1
+        return segmaps
+
     def func_keypoints(keypoints_on_images, random_state, parents, hooks):
         for keypoints_on_image in keypoints_on_images:
             for kp in keypoints_on_image.keypoints:
@@ -211,6 +269,7 @@ def test_Lambda():
     aug = iaa.Lambda(
         func_images=func_images,
         func_heatmaps=func_heatmaps,
+        func_segmentation_maps=func_segmaps,
         func_keypoints=func_keypoints,
         func_polygons=func_polygons
     )
@@ -245,6 +304,14 @@ def test_Lambda():
         assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
         assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
         assert np.allclose(observed.get_arr(), heatmaps_arr_aug)
+
+        observed = aug.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 3, 3)
+        assert np.array_equal(observed.get_arr(), segmaps_arr_aug)
+
+        observed = aug_det.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 3, 3)
+        assert np.array_equal(observed.get_arr(), segmaps_arr_aug)
 
         observed = aug.augment_keypoints(keypoints)
         expected = keypoints_aug
@@ -338,6 +405,11 @@ def test_AssertLambda():
                                [0.0, 1.0, 1.0]])
     heatmaps = ia.HeatmapsOnImage(heatmaps_arr, shape=(3, 3, 3))
 
+    segmaps_arr = np.int32([[0, 0, 1],
+                            [0, 0, 1],
+                            [0, 1, 1]])
+    segmaps = SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))
+
     keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=0, y=0), ia.Keypoint(x=1, y=1),
                                       ia.Keypoint(x=2, y=2)], shape=base_img.shape)]
 
@@ -357,6 +429,12 @@ def test_AssertLambda():
     def func_heatmaps_fails(heatmaps, random_state, parents, hooks):
         return heatmaps[0].arr_0to1[0, 0] > 0 + 1e-6
 
+    def func_segmaps_succeeds(segmaps, random_state, parents, hooks):
+        return segmaps[0].arr[0, 0] == 0
+
+    def func_segmaps_fails(segmaps, random_state, parents, hooks):
+        return segmaps[0].arr[0, 0] == 1
+
     def func_keypoints_succeeds(keypoints_on_images, random_state, parents, hooks):
         return keypoints_on_images[0].keypoints[0].x == 0 and keypoints_on_images[0].keypoints[2].x == 2
 
@@ -372,11 +450,13 @@ def test_AssertLambda():
 
     aug_succeeds = iaa.AssertLambda(func_images=func_images_succeeds,
                                     func_heatmaps=func_heatmaps_succeeds,
+                                    func_segmentation_maps=func_segmaps_succeeds,
                                     func_keypoints=func_keypoints_succeeds,
                                     func_polygons=func_polygons_succeeds)
     aug_succeeds_det = aug_succeeds.to_deterministic()
     aug_fails = iaa.AssertLambda(func_images=func_images_fails,
                                  func_heatmaps=func_heatmaps_fails,
+                                 func_segmentation_maps=func_segmaps_fails,
                                  func_keypoints=func_keypoints_fails,
                                  func_polygons=func_polygons_fails,)
 
@@ -449,6 +529,29 @@ def test_AssertLambda():
     errored = False
     try:
         _ = aug_fails.augment_heatmaps([heatmaps])[0]
+    except AssertionError as e:
+        errored = True
+    assert errored
+
+    # segmaps
+    observed = aug_succeeds.augment_segmentation_maps([segmaps])[0]
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.get_arr(), segmaps.get_arr())
+
+    errored = False
+    try:
+        _ = aug_fails.augment_segmentation_maps([segmaps])[0]
+    except AssertionError:
+        errored = True
+    assert errored
+
+    observed = aug_succeeds_det.augment_segmentation_maps([segmaps])[0]
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.get_arr(), segmaps.get_arr())
+
+    errored = False
+    try:
+        _ = aug_fails.augment_segmentation_maps([segmaps])[0]
     except AssertionError as e:
         errored = True
     assert errored
@@ -587,6 +690,10 @@ def test_AssertShape():
                                [0.0, 0.0, 1.0, 0.0],
                                [0.0, 1.0, 1.0, 0.0]])
     heatmaps = ia.HeatmapsOnImage(heatmaps_arr, shape=(3, 4, 3))
+    segmaps_arr = np.int32([[0, 0, 1, 0],
+                            [0, 0, 1, 0],
+                            [0, 1, 1, 0]])
+    segmaps = SegmentationMapsOnImage(segmaps_arr, shape=(3, 4, 3))
     keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=0, y=0), ia.Keypoint(x=1, y=1),
                                       ia.Keypoint(x=2, y=2)], shape=base_img.shape)]
     polygons = [ia.PolygonsOnImage(
@@ -605,6 +712,11 @@ def test_AssertShape():
                                   [0.0, 1.0, 1.0, 0.0],
                                   [1.0, 0.0, 1.0, 0.0]])
     heatmaps_h4 = ia.HeatmapsOnImage(heatmaps_arr_h4, shape=(4, 4, 3))
+    segmaps_arr_h4 = np.int32([[0, 0, 1, 0],
+                               [0, 0, 1, 0],
+                               [0, 1, 1, 0],
+                               [1, 0, 1, 0]])
+    segmaps_h4 = SegmentationMapsOnImage(segmaps_arr_h4, shape=(4, 4, 3))
     keypoints_h4 = [ia.KeypointsOnImage([ia.Keypoint(x=0, y=0), ia.Keypoint(x=1, y=1),
                                          ia.Keypoint(x=2, y=2)], shape=base_img_h4.shape)]
     polygons_h4 = [ia.PolygonsOnImage(
@@ -645,6 +757,14 @@ def test_AssertShape():
         assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
         assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
         assert np.allclose(observed.get_arr(), heatmaps.get_arr())
+
+        observed = aug.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), segmaps.get_arr())
+
+        observed = aug_det.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), segmaps.get_arr())
 
         observed = aug.augment_keypoints(keypoints)
         expected = keypoints
@@ -724,6 +844,14 @@ def test_AssertShape():
         assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
         assert np.allclose(observed.get_arr(), heatmaps.get_arr())
 
+        observed = aug.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), heatmaps.get_arr())
+
+        observed = aug_det.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), segmaps.get_arr())
+
         observed = aug.augment_polygons(polygons)
         expected = polygons
         assert len(observed) == 1
@@ -794,6 +922,14 @@ def test_AssertShape():
         assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
         assert np.allclose(observed.get_arr(), heatmaps.get_arr())
 
+        observed = aug.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), segmaps.get_arr())
+
+        observed = aug_det.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), segmaps.get_arr())
+
         observed = aug.augment_keypoints(keypoints)
         expected = keypoints
         assert keypoints_equal(observed, expected)
@@ -830,6 +966,13 @@ def test_AssertShape():
         errored = False
         try:
             _ = aug.augment_heatmaps([heatmaps_h4])[0]
+        except AssertionError:
+            errored = True
+        assert errored
+
+        errored = False
+        try:
+            _ = aug.augment_segmentation_maps([segmaps_h4])[0]
         except AssertionError:
             errored = True
         assert errored
@@ -872,6 +1015,14 @@ def test_AssertShape():
         assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
         assert np.allclose(observed.get_arr(), heatmaps.get_arr())
 
+        observed = aug.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), heatmaps.get_arr())
+
+        observed = aug_det.augment_segmentation_maps([segmaps])[0]
+        assert observed.shape == (3, 4, 3)
+        assert np.array_equal(observed.get_arr(), heatmaps.get_arr())
+
         observed = aug.augment_keypoints(keypoints)
         expected = keypoints
         assert keypoints_equal(observed, expected)
@@ -908,6 +1059,13 @@ def test_AssertShape():
         errored = False
         try:
             _ = aug.augment_heatmaps([heatmaps_h4])[0]
+        except AssertionError:
+            errored = True
+        assert errored
+
+        errored = False
+        try:
+            _ = aug.augment_segmentation_maps([segmaps_h4])[0]
         except AssertionError:
             errored = True
         assert errored
@@ -1040,9 +1198,9 @@ def test_clip_augmented_images_():
         images[i][0, 2] = 30
     images_clipped = iaa.clip_augmented_images_(images, min_value=15, max_value=25)
     assert isinstance(images_clipped, list)
-    assert all([images_clipped[i][0, 0] == 15 for i in sm.xrange(len(images))])
-    assert all([images_clipped[i][0, 1] == 20 for i in sm.xrange(len(images))])
-    assert all([images_clipped[i][0, 2] == 25 for i in sm.xrange(len(images))])
+    assert np.all([images_clipped[i][0, 0] == 15 for i in sm.xrange(len(images))])
+    assert np.all([images_clipped[i][0, 1] == 20 for i in sm.xrange(len(images))])
+    assert np.all([images_clipped[i][0, 2] == 25 for i in sm.xrange(len(images))])
 
 
 def test_clip_augmented_images():
@@ -1062,9 +1220,9 @@ def test_clip_augmented_images():
         images[i][0, 2] = 30
     images_clipped = iaa.clip_augmented_images(images, min_value=15, max_value=25)
     assert isinstance(images_clipped, list)
-    assert all([images_clipped[i][0, 0] == 15 for i in sm.xrange(len(images))])
-    assert all([images_clipped[i][0, 1] == 20 for i in sm.xrange(len(images))])
-    assert all([images_clipped[i][0, 2] == 25 for i in sm.xrange(len(images))])
+    assert np.all([images_clipped[i][0, 0] == 15 for i in sm.xrange(len(images))])
+    assert np.all([images_clipped[i][0, 1] == 20 for i in sm.xrange(len(images))])
+    assert np.all([images_clipped[i][0, 2] == 25 for i in sm.xrange(len(images))])
 
 
 def test_reduce_to_nonempty():
@@ -1115,7 +1273,7 @@ def test_invert_reduce_to_nonempty():
     assert kpsois_recovered == ["foo1", "foo2", "foo3"]
 
     kpsois_recovered = iaa.invert_reduce_to_nonempty(kpsois, [1], ["foo1"])
-    assert all([isinstance(kpsoi, ia.KeypointsOnImage) for kpsoi in kpsois]) # assert original list not changed
+    assert np.all([isinstance(kpsoi, ia.KeypointsOnImage) for kpsoi in kpsois]) # assert original list not changed
     assert kpsois_recovered == [kpsois[0], "foo1", kpsois[2]]
 
     kpsois_recovered = iaa.invert_reduce_to_nonempty(kpsois, [], [])
@@ -1159,6 +1317,9 @@ def test_Augmenter():
     # augment_batches
     # --------
     # TODO incomplete tests, handle only cases that were missing in code coverage report
+
+    # deactivated these tests as they covered deprecated inputs for augment_batches()
+    """
     aug = DummyAugmenter()
     batches_aug = list(aug.augment_batches([[]]))
     assert isinstance(batches_aug, list)
@@ -1178,6 +1339,7 @@ def test_Augmenter():
     assert isinstance(batches_aug, list)
     assert len(batches_aug) == 1
     assert array_equal_lists(batches_aug[0], image_batches[0])
+    """
 
     aug = DummyAugmenter()
     got_exception = False
@@ -1237,7 +1399,7 @@ def test_Augmenter():
             seen[0] += 1
         else:
             seen[1] += 1
-        assert all([image.ndim == 3 and 48 <= image.shape[0] <= 62 and 48 <= image.shape[1] <= 62 and image.shape[2] == 3 for image in observed])
+        assert np.all([image.ndim == 3 and 48 <= image.shape[0] <= 62 and 48 <= image.shape[1] <= 62 and image.shape[2] == 3 for image in observed])
     assert seen[0] <= 3
     assert seen[1] >= 17
 
@@ -1251,7 +1413,7 @@ def test_Augmenter():
             seen[0] += 1
         else:
             seen[1] += 1
-        assert all([image.ndim == 3 and 48 <= image.shape[0] <= 62 and 48 <= image.shape[1] <= 62  and image.shape[2] == 1 for image in observed])
+        assert np.all([image.ndim == 3 and 48 <= image.shape[0] <= 62 and 48 <= image.shape[1] <= 62  and image.shape[2] == 1 for image in observed])
     assert seen[0] <= 3
     assert seen[1] >= 17
 
@@ -1265,7 +1427,7 @@ def test_Augmenter():
             seen[0] += 1
         else:
             seen[1] += 1
-        assert all([image.ndim == 2 and 48 <= image.shape[0] <= 62 and 48 <= image.shape[1] <= 62 for image in observed])
+        assert np.all([image.ndim == 2 and 48 <= image.shape[0] <= 62 and 48 <= image.shape[1] <= 62 for image in observed])
     assert seen[0] <= 3
     assert seen[1] >= 17
 
@@ -1564,6 +1726,216 @@ def test_Augmenter():
         "DummyAugmenterRepr(name=Example, parameters=[A, B, C], deterministic=True)"
 
 
+def test_Augmenter_augment_batches():
+    reseed()
+
+    image = np.array([[0, 0, 1, 1, 1],
+                      [0, 0, 1, 1, 1],
+                      [0, 1, 1, 1, 1]], dtype=np.uint8)
+    image_flipped = np.fliplr(image)
+    keypoint = ia.Keypoint(x=2, y=1)
+    keypoints = [ia.KeypointsOnImage([keypoint], shape=image.shape + (1,))]
+    kp_flipped = ia.Keypoint(
+        x=image.shape[1]-keypoint.x,
+        y=keypoint.y
+    )
+
+    # basic functionality test (images as list)
+    for bg in [True, False]:
+        seq = iaa.Fliplr(1.0)
+        batches = [ia.Batch(images=[np.copy(image)], keypoints=keypoints)]
+        batches_aug = list(seq.augment_batches(batches, background=bg))
+        assert np.array_equal(batches_aug[0].images_aug[0], image_flipped)
+        assert batches_aug[0].keypoints_aug[0].keypoints[0].x == kp_flipped.x
+        assert batches_aug[0].keypoints_aug[0].keypoints[0].y == kp_flipped.y
+        assert np.array_equal(batches_aug[0].images_unaug[0], image)
+        assert batches_aug[0].keypoints_unaug[0].keypoints[0].x == keypoint.x
+        assert batches_aug[0].keypoints_unaug[0].keypoints[0].y == keypoint.y
+
+    # basic functionality test (images as array)
+    for bg in [True, False]:
+        seq = iaa.Fliplr(1.0)
+        batches = [ia.Batch(images=np.uint8([np.copy(image)]), keypoints=keypoints)]
+        batches_aug = list(seq.augment_batches(batches, background=bg))
+        assert np.array_equal(batches_aug[0].images_aug, np.uint8([image_flipped]))
+        assert batches_aug[0].keypoints_aug[0].keypoints[0].x == kp_flipped.x
+        assert batches_aug[0].keypoints_aug[0].keypoints[0].y == kp_flipped.y
+        assert np.array_equal(batches_aug[0].images_unaug, np.uint8([image]))
+        assert batches_aug[0].keypoints_unaug[0].keypoints[0].x == keypoint.x
+        assert batches_aug[0].keypoints_unaug[0].keypoints[0].y == keypoint.y
+
+    """
+    seq = iaa.Fliplr(0.5)
+    # with images as list, background=False
+    nb_flipped_images = 0
+    nb_flipped_keypoints = 0
+    nb_iterations = 1000
+    batches = [ia.Batch(images=[np.copy(image)], keypoints=[keypoints[0].deepcopy()]) for _ in sm.xrange(nb_iterations)]
+    batches_aug = list(seq.augment_batches(batches, background=False))
+    for batch_aug in batches_aug:
+        image_aug = batch_aug.images_aug[0]
+        keypoint_aug = batch_aug.keypoints_aug[0].keypoints[0]
+        assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
+        if np.array_equal(image_aug, image_flipped):
+            nb_flipped_images += 1
+
+        assert (keypoint_aug.x == keypoint.x and keypoint_aug.y == keypoint.y) \
+               or (keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y)
+        if keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y:
+            nb_flipped_keypoints += 1
+    assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
+    assert nb_flipped_images == nb_flipped_keypoints
+    """
+
+    seq = iaa.Fliplr(0.5)
+    for bg in [False, True]:
+        # with images as list
+        nb_flipped_images = 0
+        nb_flipped_keypoints = 0
+        nb_iterations = 1000
+        batches = [ia.Batch(images=[np.copy(image)], keypoints=[keypoints[0].deepcopy()])
+                   for _ in sm.xrange(nb_iterations)]
+        batches_aug = list(seq.augment_batches(batches, background=bg))
+        for batch_aug in batches_aug:
+            image_aug = batch_aug.images_aug[0]
+            keypoint_aug = batch_aug.keypoints_aug[0].keypoints[0]
+            assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
+            if np.array_equal(image_aug, image_flipped):
+                nb_flipped_images += 1
+
+            assert np.isclose(keypoint_aug.x, keypoint.x) and np.isclose(keypoint_aug.y, keypoint.y) \
+                or np.isclose(keypoint_aug.x, kp_flipped.x) and np.isclose(keypoint_aug.y, kp_flipped.y)
+            if np.isclose(keypoint_aug.x, kp_flipped.x) and np.isclose(keypoint_aug.y, kp_flipped.y):
+                nb_flipped_keypoints += 1
+        assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
+        assert nb_flipped_images == nb_flipped_keypoints
+
+        # with images as array
+        nb_flipped_images = 0
+        nb_iterations = 1000
+        batches = [ia.Batch(images=np.array([np.copy(image)], dtype=np.uint8), keypoints=None) for _ in sm.xrange(nb_iterations)]
+        batches_aug = list(seq.augment_batches(batches, background=bg))
+        for batch_aug in batches_aug:
+            image_aug = batch_aug.images_aug[0]
+            assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
+            if np.array_equal(image_aug, image_flipped):
+                nb_flipped_images += 1
+        assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
+
+        # deactivated for now as only Batch and list(Batch) are valid inputs,
+        # other inputs are deprecated
+        # TODO time to drop completely?
+        """
+        # array (N, H, W) as input
+        nb_flipped_images = 0
+        nb_iterations = 1000
+        batches = [np.array([np.copy(image)], dtype=np.uint8) for _ in sm.xrange(nb_iterations)]
+        batches_aug = list(seq.augment_batches(batches, background=bg))
+        for batch_aug in batches_aug:
+            image_aug = batch_aug[0]
+            assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
+            if np.array_equal(image_aug, image_flipped):
+                nb_flipped_images += 1
+        assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
+
+        # list of list of KeypointsOnImage as input
+        nb_flipped_keypoints = 0
+        nb_iterations = 1000
+        batches = [[keypoints[0].deepcopy()] for _ in sm.xrange(nb_iterations)]
+        batches_aug = list(seq.augment_batches(batches, background=bg))
+        for batch_aug in batches_aug:
+            # TODO test seems to be geared here towards original data, but variable is named as "_aug"
+            keypoint_aug = batch_aug[0].keypoints[0]
+
+            assert (keypoint_aug.x == keypoint.x and keypoint_aug.y == keypoint.y) \
+                   or (keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y)
+            if keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y:
+                nb_flipped_keypoints += 1
+        assert 0.4*nb_iterations <= nb_flipped_keypoints <= 0.6*nb_iterations
+        """
+
+    # test all augmenters
+    # this test is currently skipped by default as it takes around 40s on its own,
+    # probably because of having to start background processes
+    """
+    augs = [
+        iaa.Sequential([iaa.Fliplr(1.0), iaa.Flipud(1.0)]),
+        iaa.SomeOf(1, [iaa.Fliplr(1.0), iaa.Flipud(1.0)]),
+        iaa.OneOf([iaa.Fliplr(1.0), iaa.Flipud(1.0)]),
+        iaa.Sometimes(1.0, iaa.Fliplr(1)),
+        iaa.WithColorspace("HSV", children=iaa.Add((-50, 50))),
+        iaa.WithChannels([0], iaa.Add((-50, 50))),
+        iaa.Noop(name="Noop-nochange"),
+        iaa.Lambda(
+            func_images=lambda images, random_state, parents, hooks: images,
+            func_keypoints=lambda keypoints_on_images, random_state, parents, hooks: keypoints_on_images,
+            name="Lambda-nochange"
+        ),
+        iaa.AssertLambda(
+            func_images=lambda images, random_state, parents, hooks: True,
+            func_keypoints=lambda keypoints_on_images, random_state, parents, hooks: True,
+            name="AssertLambda-nochange"
+        ),
+        iaa.AssertShape(
+            (None, 64, 64, 3),
+            check_keypoints=False,
+            name="AssertShape-nochange"
+        ),
+        iaa.Resize((0.5, 0.9)),
+        iaa.CropAndPad(px=(-50, 50)),
+        iaa.Pad(px=(1, 50)),
+        iaa.Crop(px=(1, 50)),
+        iaa.Fliplr(1.0),
+        iaa.Flipud(1.0),
+        iaa.Superpixels(p_replace=(0.25, 1.0), n_segments=(16, 128)),
+        iaa.ChangeColorspace(to_colorspace="GRAY"),
+        iaa.Grayscale(alpha=(0.1, 1.0)),
+        iaa.GaussianBlur(1.0),
+        iaa.AverageBlur(5),
+        iaa.MedianBlur(5),
+        iaa.Convolve(np.array([[0, 1, 0],
+                               [1, -4, 1],
+                               [0, 1, 0]])),
+        iaa.Sharpen(alpha=(0.1, 1.0), lightness=(0.8, 1.2)),
+        iaa.Emboss(alpha=(0.1, 1.0), strength=(0.8, 1.2)),
+        iaa.EdgeDetect(alpha=(0.1, 1.0)),
+        iaa.DirectedEdgeDetect(alpha=(0.1, 1.0), direction=(0.0, 1.0)),
+        iaa.Add((-50, 50)),
+        iaa.AddElementwise((-50, 50)),
+        iaa.AdditiveGaussianNoise(scale=(0.1, 1.0)),
+        iaa.Multiply((0.6, 1.4)),
+        iaa.MultiplyElementwise((0.6, 1.4)),
+        iaa.Dropout((0.3, 0.5)),
+        iaa.CoarseDropout((0.3, 0.5), size_percent=(0.05, 0.2)),
+        iaa.Invert(0.5),
+        iaa.ContrastNormalization((0.6, 1.4)),
+        iaa.Affine(scale=(0.7, 1.3), translate_percent=(-0.1, 0.1), rotate=(-20, 20),
+                   shear=(-20, 20), order=ia.ALL, mode=ia.ALL, cval=(0, 255)),
+        iaa.PiecewiseAffine(scale=(0.1, 0.3)),
+        iaa.ElasticTransformation(alpha=0.5)
+    ]
+
+    nb_iterations = 100
+    image = ia.quokka(size=(64, 64))
+    batch = ia.Batch(images=np.array([image]), keypoints=keypoints)
+    batches = [ia.Batch(images=[np.copy(image)], keypoints=[keypoints[0].deepcopy()])
+               for _ in sm.xrange(nb_iterations)]
+    for aug in augs:
+        nb_changed = 0
+        batches_aug = list(aug.augment_batches(batches, background=True))
+        for batch_aug in batches_aug:
+            image_aug = batch_aug.images_aug[0]
+            if image.shape != image_aug.shape or not np.array_equal(image, image_aug):
+                nb_changed += 1
+                if nb_changed > 10:
+                    break
+        if "-nochange" not in aug.name:
+            assert nb_changed > 0
+        else:
+            assert nb_changed == 0
+    """
+
+
 def test_Augmenter_augment_heatmaps():
     reseed()
     heatmap = ia.HeatmapsOnImage(
@@ -1665,22 +2037,23 @@ def test_Augmenter_augment_keypoints():
 
     aug = iaa.Rot90(1, keep_size=False)
     kpsoi_aug = aug.augment_keypoints(kpsoi)
-    # TODO -1 here added because that is done in Rot90, but will have to be fixed
-    assert np.allclose(kpsoi_aug.keypoints[0].x, 5 - 2 - 1)
+    # set offset to -1 if Rot90 uses int-based coordinate transformation
+    kp_offset = 0
+    assert np.allclose(kpsoi_aug.keypoints[0].x, 5 - 2 + kp_offset)
     assert np.allclose(kpsoi_aug.keypoints[0].y, 1)
-    assert np.allclose(kpsoi_aug.keypoints[1].x, 5 - 5 - 1)
+    assert np.allclose(kpsoi_aug.keypoints[1].x, 5 - 5 + kp_offset)
     assert np.allclose(kpsoi_aug.keypoints[1].y, 2)
-    assert np.allclose(kpsoi_aug.keypoints[2].x, 5 - 3 - 1)
+    assert np.allclose(kpsoi_aug.keypoints[2].x, 5 - 3 + kp_offset)
     assert np.allclose(kpsoi_aug.keypoints[2].y, 3)
 
     aug = iaa.Rot90(1, keep_size=False)
     kpsoi_aug = aug.augment_keypoints([kpsoi, kpsoi, kpsoi])
     for i in range(3):
-        assert np.allclose(kpsoi_aug[i].keypoints[0].x, 5 - 2 - 1)
+        assert np.allclose(kpsoi_aug[i].keypoints[0].x, 5 - 2 + kp_offset)
         assert np.allclose(kpsoi_aug[i].keypoints[0].y, 1)
-        assert np.allclose(kpsoi_aug[i].keypoints[1].x, 5 - 5 - 1)
+        assert np.allclose(kpsoi_aug[i].keypoints[1].x, 5 - 5 + kp_offset)
         assert np.allclose(kpsoi_aug[i].keypoints[1].y, 2)
-        assert np.allclose(kpsoi_aug[i].keypoints[2].x, 5 - 3 - 1)
+        assert np.allclose(kpsoi_aug[i].keypoints[2].x, 5 - 3 + kp_offset)
         assert np.allclose(kpsoi_aug[i].keypoints[2].y, 3)
 
 
@@ -1701,27 +2074,28 @@ def test_Augmenter_augment_bounding_boxes():
 
     aug = iaa.Rot90(1, keep_size=False)
     bbsoi_aug = aug.augment_bounding_boxes(bbsoi)
-    # TODO -1 here added because that is done in Rot90, but will have to be fixed
+    # set offset to -1 if Rot90 uses int-based coordinate transformation
+    kp_offset = 0
     # Note here that the new coordinates are minima/maxima of the BB, so not as
     # straight forward to compute the new coords as for keypoint augmentation
-    assert np.allclose(bbsoi_aug.bounding_boxes[0].x1, 5 - 5 - 1)
-    assert np.allclose(bbsoi_aug.bounding_boxes[0].x2, 5 - 4 - 1)
+    assert np.allclose(bbsoi_aug.bounding_boxes[0].x1, 5 - 5 + kp_offset)
+    assert np.allclose(bbsoi_aug.bounding_boxes[0].x2, 5 - 4 + kp_offset)
     assert np.allclose(bbsoi_aug.bounding_boxes[0].y1, 1)
     assert np.allclose(bbsoi_aug.bounding_boxes[0].y2, 3)
-    assert np.allclose(bbsoi_aug.bounding_boxes[1].x1, 5 - 2 - 1)
-    assert np.allclose(bbsoi_aug.bounding_boxes[1].x2, 5 - 0 - 1)
+    assert np.allclose(bbsoi_aug.bounding_boxes[1].x1, 5 - 2 + kp_offset)
+    assert np.allclose(bbsoi_aug.bounding_boxes[1].x2, 5 - 0 + kp_offset)
     assert np.allclose(bbsoi_aug.bounding_boxes[1].y1, 2.5)
     assert np.allclose(bbsoi_aug.bounding_boxes[1].y2, 3)
 
     aug = iaa.Rot90(1, keep_size=False)
     bbsoi_aug = aug.augment_bounding_boxes([bbsoi, bbsoi, bbsoi])
     for i in range(3):
-        assert np.allclose(bbsoi_aug[i].bounding_boxes[0].x1, 5 - 5 - 1)
-        assert np.allclose(bbsoi_aug[i].bounding_boxes[0].x2, 5 - 4 - 1)
+        assert np.allclose(bbsoi_aug[i].bounding_boxes[0].x1, 5 - 5 + kp_offset)
+        assert np.allclose(bbsoi_aug[i].bounding_boxes[0].x2, 5 - 4 + kp_offset)
         assert np.allclose(bbsoi_aug[i].bounding_boxes[0].y1, 1)
         assert np.allclose(bbsoi_aug[i].bounding_boxes[0].y2, 3)
-        assert np.allclose(bbsoi_aug[i].bounding_boxes[1].x1, 5 - 2 - 1)
-        assert np.allclose(bbsoi_aug[i].bounding_boxes[1].x2, 5 - 0 - 1)
+        assert np.allclose(bbsoi_aug[i].bounding_boxes[1].x1, 5 - 2 + kp_offset)
+        assert np.allclose(bbsoi_aug[i].bounding_boxes[1].x2, 5 - 0 + kp_offset)
         assert np.allclose(bbsoi_aug[i].bounding_boxes[1].y1, 2.5)
         assert np.allclose(bbsoi_aug[i].bounding_boxes[1].y2, 3)
 
@@ -1764,24 +2138,25 @@ def test_Augmenter_augment_polygons():
     assert isinstance(poly_ois_aug[0], ia.PolygonsOnImage)
     assert len(poly_ois_aug[0].polygons) == 2
     assert len(poly_ois_aug[1].polygons) == 2
+    kp_offset = 0
     assert np.allclose(
         poly_ois_aug[0].polygons[0].exterior,
-        [(9, 0), (9, 5), (4, 5)],
+        [(10-0+kp_offset, 0), (10-0+kp_offset, 5), (10-5+kp_offset, 5)],
         atol=1e-4, rtol=0
     )
     assert np.allclose(
         poly_ois_aug[0].polygons[1].exterior,
-        [(8, 1), (8, 6), (3, 6)],
+        [(10-1+kp_offset, 1), (10-1+kp_offset, 6), (10-6+kp_offset, 6)],
         atol=1e-4, rtol=0
     )
     assert np.allclose(
         poly_ois_aug[1].polygons[0].exterior,
-        [(7, 2), (7, 7), (2, 7)],
+        [(10-2+kp_offset, 2), (10-2+kp_offset, 7), (10-7+kp_offset, 7)],
         atol=1e-4, rtol=0
     )
     assert np.allclose(
         poly_ois_aug[1].polygons[1].exterior,
-        [(6, 3), (6, 8), (1, 8)],
+        [(10-3+kp_offset, 3), (10-3+kp_offset, 8), (10-8+kp_offset, 8)],
         atol=1e-4, rtol=0
     )
     assert poly_ois_aug[0].shape == (10, 10, 3)
@@ -1857,9 +2232,9 @@ def test_Augmenter_augment_polygons():
     image_rots = [iaa.Rot90(k, keep_size=False).augment_image(image) for k in [0, 1, 2, 3]]
     polys_rots = [
         [(0, 0), (10, 0), (10, 20)],
-        [(9, 0), (9, 10), (-11, 10)],
-        [(19, 9), (9, 9), (9, -11)],
-        [(0, 19), (0, 9), (20, 9)]
+        [(10-0+kp_offset, 0), (10-0+kp_offset, 10), (10-20+kp_offset, 10)],
+        [(20-0+kp_offset, 10), (20-10+kp_offset, 10), (20-10+kp_offset, -10)],
+        [(10-10+kp_offset, 20), (10-10+kp_offset, 10), (10-(-10)+kp_offset, 10)]
     ]
 
     poly_ois = [ia.PolygonsOnImage([poly], shape=image.shape) for _ in sm.xrange(50)]
@@ -1868,12 +2243,20 @@ def test_Augmenter_augment_polygons():
     poly_ois_aug = aug_det.augment_polygons(poly_ois)
     seen = set()
     for image_aug, poly_oi_aug in zip(images_aug, poly_ois_aug):
+        found_image = False
         for img_rot_idx, img_rot in enumerate(image_rots):
             if image_aug.shape == img_rot.shape and np.allclose(image_aug, img_rot):
+                found_image = True
                 break
+
+        found_poly = False
         for poly_rot_idx, poly_rot in enumerate(polys_rots):
             if np.allclose(poly_oi_aug.polygons[0].exterior, poly_rot):
+                found_poly = True
                 break
+
+        assert found_image
+        assert found_poly
         assert img_rot_idx == poly_rot_idx
         seen.add((img_rot_idx, poly_rot_idx))
     assert 2 <= len(seen) <= 4  # assert not always the same rot
@@ -1937,6 +2320,230 @@ def test_Augmenter_augment_polygons():
             assert np.array_equal(translations_imgs, translations_points)
 
 
+# TODO merge this test with test_Augmenter_augment_polygons()?
+#      they are almost identical -- essentially just different variable names,
+#      class names, .exterior instead of .coords and augment_polygons() instead
+#      of augment_line_strings()
+def test_Augmenter_augment_line_strings():
+    reseed()
+
+    # single instance of LineStringsOnImage with 0 line strings
+    aug = iaa.Rot90(1, keep_size=False)
+    ls_oi = ia.LineStringsOnImage([], shape=(10, 11, 3))
+    ls_oi_aug = aug.augment_line_strings(ls_oi)
+    assert isinstance(ls_oi_aug, ia.LineStringsOnImage)
+    assert len(ls_oi_aug.line_strings) == 0
+    assert ls_oi_aug.shape == (11, 10, 3)
+
+    # list of LineStringsOnImage with 0 line strings
+    aug = iaa.Rot90(1, keep_size=False)
+    ls_oi = ia.LineStringsOnImage([], shape=(10, 11, 3))
+    ls_oi_aug = aug.augment_line_strings([ls_oi])
+    assert isinstance(ls_oi_aug, list)
+    assert isinstance(ls_oi_aug[0], ia.LineStringsOnImage)
+    assert len(ls_oi_aug[0].line_strings) == 0
+    assert ls_oi_aug[0].shape == (11, 10, 3)
+
+    # 2 LineStringsOnImage, each 2 line strings
+    aug = iaa.Rot90(1, keep_size=False)
+    ls_ois = [
+        ia.LineStringsOnImage(
+            [ia.LineString([(0, 0), (5, 0), (5, 5)]),
+             ia.LineString([(1, 1), (6, 1), (6, 6)])],
+            shape=(10, 10, 3)),
+        ia.LineStringsOnImage(
+            [ia.LineString([(2, 2), (7, 2), (7, 7)]),
+             ia.LineString([(3, 3), (8, 3), (8, 8)])],
+            shape=(10, 10, 3)),
+    ]
+    ls_ois_aug = aug.augment_line_strings(ls_ois)
+    assert isinstance(ls_ois_aug, list)
+    assert isinstance(ls_ois_aug[0], ia.LineStringsOnImage)
+    assert isinstance(ls_ois_aug[0], ia.LineStringsOnImage)
+    assert len(ls_ois_aug[0].line_strings) == 2
+    assert len(ls_ois_aug[1].line_strings) == 2
+    kp_offset = 0
+    assert np.allclose(
+        ls_ois_aug[0].line_strings[0].coords,
+        [(10-0+kp_offset, 0), (10-0+kp_offset, 5), (10-5+kp_offset, 5)],
+        atol=1e-4, rtol=0
+    )
+    assert np.allclose(
+        ls_ois_aug[0].line_strings[1].coords,
+        [(10-1+kp_offset, 1), (10-1+kp_offset, 6), (10-6+kp_offset, 6)],
+        atol=1e-4, rtol=0
+    )
+    assert np.allclose(
+        ls_ois_aug[1].line_strings[0].coords,
+        [(10-2+kp_offset, 2), (10-2+kp_offset, 7), (10-7+kp_offset, 7)],
+        atol=1e-4, rtol=0
+    )
+    assert np.allclose(
+        ls_ois_aug[1].line_strings[1].coords,
+        [(10-3+kp_offset, 3), (10-3+kp_offset, 8), (10-8+kp_offset, 8)],
+        atol=1e-4, rtol=0
+    )
+    assert ls_ois_aug[0].shape == (10, 10, 3)
+    assert ls_ois_aug[1].shape == (10, 10, 3)
+
+    # test whether there is randomness within each batch and between batches
+    aug = iaa.Rot90((0, 3), keep_size=False)
+    ls = ia.LineString([(0, 0), (5, 0), (5, 5)])
+    ls_oi = ia.LineStringsOnImage(
+        [ls.deepcopy() for _ in sm.xrange(100)],
+        shape=(10, 11, 3)
+    )
+    ls_ois = [ls_oi, ls_oi.deepcopy()]
+    lss_ois_aug1 = aug.augment_line_strings(ls_ois)
+    lss_ois_aug2 = aug.augment_line_strings(ls_ois)
+
+    # --> different between runs
+    points1 = [ls.coords for ls_oi in lss_ois_aug1 for ls in ls_oi.line_strings]
+    points2 = [ls.coords for ls_oi in lss_ois_aug2 for ls in ls_oi.line_strings]
+    points1 = np.float32(points1)
+    points2 = np.float32(points2)
+    assert not np.allclose(points1, points2, atol=1e-2, rtol=0)
+
+    # --> different between LineStringsOnImages
+    points1 = [ls.coords for ls in lss_ois_aug1[0].line_strings]
+    points2 = [ls.coords for ls in lss_ois_aug1[1].line_strings]  # aug1 is correct here
+    points1 = np.float32(points1)
+    points2 = np.float32(points2)
+    assert not np.allclose(points1, points2, atol=1e-2, rtol=0)
+
+    # --> different between polygons
+    points1 = set()
+    for ls in lss_ois_aug1[0].line_strings:
+        for point in ls.coords:
+            points1.add(tuple(
+                [int(point[0]*10), int(point[1]*10)]
+            ))
+    assert len(points1) > 1
+
+    # test determinism
+    aug_det = aug.to_deterministic()
+    ls = ia.LineString([(0, 0), (5, 0), (5, 5)])
+    ls_oi = ia.LineStringsOnImage(
+        [ls.deepcopy() for _ in sm.xrange(100)],
+        shape=(10, 11, 3)
+    )
+    ls_ois = [ls_oi, ls_oi.deepcopy()]
+    lss_ois_aug1 = aug_det.augment_line_strings(ls_ois)
+    lss_ois_aug2 = aug_det.augment_line_strings(ls_ois)
+
+    # --> different within the same run
+    points1 = set()
+    for ls in lss_ois_aug1[0].line_strings:
+        for point in ls.coords:
+            points1.add(tuple(
+                [int(point[0]*10), int(point[1]*10)]
+            ))
+    assert len(points1) > 1
+
+    # --> similar between augmentation runs
+    points1 = [ls.coords for ls_oi in lss_ois_aug1 for ls in ls_oi.line_strings]
+    points2 = [ls.coords for ls_oi in lss_ois_aug2 for ls in ls_oi.line_strings]
+    points1 = np.float32(points1)
+    points2 = np.float32(points2)
+    assert np.allclose(points1, points2, atol=1e-2, rtol=0)
+
+    # test if augmentation aligned with images
+    aug = iaa.Rot90((0, 3), keep_size=False)
+    image = np.zeros((10, 20), dtype=np.uint8)
+    image[5, :] = 255
+    image[2:5, 10] = 255
+    ls = ia.LineString([(0, 0), (10, 0), (10, 20)])
+    image_rots = [iaa.Rot90(k, keep_size=False).augment_image(image) for k in [0, 1, 2, 3]]
+    lss_rots = [
+        [(0, 0), (10, 0), (10, 20)],
+        [(10, 0), (10, 10), (-10, 10)],
+        [(20, 10), (10, 10), (10, -10)],
+        [(0, 20), (0, 10), (20, 10)]
+    ]
+
+    ls_ois = [ia.LineStringsOnImage([ls], shape=image.shape) for _ in sm.xrange(50)]
+    aug_det = aug.to_deterministic()
+    images_aug = aug_det.augment_images([image] * 50)
+    ls_ois_aug = aug_det.augment_line_strings(ls_ois)
+    seen = set()
+    for image_aug, ls_oi_aug in zip(images_aug, ls_ois_aug):
+        found_image = False
+        for img_rot_idx, img_rot in enumerate(image_rots):
+            if image_aug.shape == img_rot.shape and np.allclose(image_aug, img_rot):
+                found_image = True
+                break
+
+        found_ls = False
+        for ls_rot_idx, ls_rot in enumerate(lss_rots):
+            if np.allclose(ls_oi_aug.line_strings[0].coords, ls_rot):
+                found_ls = True
+                break
+
+        assert found_image
+        assert found_ls
+        assert img_rot_idx == ls_rot_idx
+        seen.add((img_rot_idx, ls_rot_idx))
+    assert 2 <= len(seen) <= 4  # assert not always the same rot
+
+    # Test if augmenting lists of LineStringsOnImage is still aligned with image
+    # augmentation when one LineStringsOnImage instance is empty (no line strings)
+    ls = ia.LineString([(0, 0), (5, 0), (5, 5), (0, 5)])
+    lssoi_lst = [
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.shift(left=1)], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([], shape=(1, 8)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.shift(left=1)], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20)),
+        ia.LineStringsOnImage([ls.deepcopy()], shape=(10, 20))
+    ]
+    image = np.zeros((10, 20), dtype=np.uint8)
+    image[0, 0] = 255
+    image[0, 5] = 255
+    image[5, 5] = 255
+    image[5, 0] = 255
+    images = np.tile(image[np.newaxis, :, :], (len(lssoi_lst), 1, 1))
+
+    aug = iaa.Affine(translate_px={"x": (0, 8)}, order=0, mode="constant", cval=0)
+
+    for _ in sm.xrange(10):
+        for is_list in [False, True]:
+            aug_det = aug.to_deterministic()
+            if is_list:
+                images_aug = aug_det.augment_images(list(images))
+            else:
+                images_aug = aug_det.augment_images(images)
+            lssoi_lst_aug = aug_det.augment_line_strings(lssoi_lst)
+
+            if is_list:
+                translations_imgs = np.argmax(np.array(images_aug, dtype=np.uint8)[:, 0, :], axis=1)
+            else:
+                translations_imgs = np.argmax(images_aug[:, 0, :], axis=1)
+            translations_points = [
+                lssoi.line_strings[0].coords[0][0] if len(lssoi.line_strings) > 0 else None
+                for lssoi
+                in lssoi_lst_aug]
+
+            assert len([
+                pointresult
+                for pointresult
+                in translations_points
+                if pointresult is None
+            ]) == 1
+            assert translations_points[5] is None
+            translations_imgs = np.concatenate([translations_imgs[0:5], translations_imgs[6:]])
+            translations_points = np.array(
+                translations_points[0:5] + translations_points[6:],
+                dtype=translations_imgs.dtype)
+            translations_points[2] -= 1
+            translations_points[8-1] -= 1
+            assert np.array_equal(translations_imgs, translations_points)
+
+
 def test_Augmenter_augment_segmentation_maps():
     reseed()
 
@@ -1945,216 +2552,544 @@ def test_Augmenter_augment_segmentation_maps():
         [0, 1, 1],
         [0, 1, 1]
     ])
-    segmap = ia.SegmentationMapOnImage(arr, shape=(3, 3), nb_classes=2)
+    segmap = ia.SegmentationMapsOnImage(arr, shape=(3, 3))
     segmap_aug = iaa.Noop().augment_segmentation_maps([segmap])[0]
-    assert np.allclose(segmap_aug.arr, segmap.arr)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
+    segmap_aug = iaa.Noop().augment_segmentation_maps(segmap)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
     segmap_aug = iaa.Add(10).augment_segmentation_maps([segmap])[0]
-    assert np.allclose(segmap_aug.arr, segmap.arr)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
+    segmap_aug = iaa.Add(10).augment_segmentation_maps(segmap)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
 
-    segmap_aug = iaa.Affine(translate_px={"x": 1}).augment_segmentation_maps([segmap])[0]
-    expected_c0 = np.float32([
-        [0, 1.0, 0],
-        [0, 1.0, 0],
-        [0, 1.0, 0]
+    segmap_aug = iaa.Affine(translate_px={"x": 1}).augment_segmentation_maps(segmap)
+    expected = np.int32([
+        [0, 0, 1],
+        [0, 0, 1],
+        [0, 0, 1]
     ])
-    expected_c1 = np.float32([
-        [0, 0, 1.0],
-        [0, 0, 1.0],
-        [0, 0, 1.0]
-    ])
-    expected = np.concatenate([
-        expected_c0[..., np.newaxis],
-        expected_c1[..., np.newaxis]
-    ], axis=2)
-    assert np.allclose(segmap_aug.arr, expected)
+    expected = expected[:, :, np.newaxis]
+    assert np.array_equal(segmap_aug.arr, expected)
 
-    segmap_aug = iaa.Pad(px=(1, 0, 0, 0), keep_size=False).augment_segmentation_maps([segmap])[0]
-    expected_c0 = np.float32([
-        [0.0, 0, 0],
-        [1.0, 0, 0],
-        [1.0, 0, 0],
-        [1.0, 0, 0]
+    segmap_aug = iaa.Pad(px=(1, 0, 0, 0), keep_size=False).augment_segmentation_maps(segmap)
+    expected = np.int32([
+        [0, 0, 0],
+        [0, 1, 1],
+        [0, 1, 1],
+        [0, 1, 1]
     ])
-    expected_c1 = np.float32([
-        [0, 0.0, 0.0],
-        [0, 1.0, 1.0],
-        [0, 1.0, 1.0],
-        [0, 1.0, 1.0]
-    ])
-    expected = np.concatenate([
-        expected_c0[..., np.newaxis],
-        expected_c1[..., np.newaxis]
-    ], axis=2)
-    assert np.allclose(segmap_aug.arr, expected)
+    expected = expected[:, :, np.newaxis]
+    assert np.array_equal(segmap_aug.arr, expected)
 
-    # some heatmaps empty
+    # ---
+    # some classes not provided (only 0 and 3)
+    # ---
     arr = np.int32([
         [0, 3, 3],
         [0, 3, 3],
         [0, 3, 3]
     ])
-    segmap = ia.SegmentationMapOnImage(arr, shape=(3, 3), nb_classes=4)
-    segmap_aug = iaa.Noop().augment_segmentation_maps([segmap])[0]
-    assert np.allclose(segmap_aug.arr, segmap.arr)
-    segmap_aug = iaa.Add(10).augment_segmentation_maps([segmap])[0]
-    assert np.allclose(segmap_aug.arr, segmap.arr)
+    segmap = ia.SegmentationMapsOnImage(arr, shape=(3, 3))
+    segmap_aug = iaa.Noop().augment_segmentation_maps(segmap)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
+    segmap_aug = iaa.Add(10).augment_segmentation_maps(segmap)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
 
-    segmap_aug = iaa.Affine(translate_px={"x":1}).augment_segmentation_maps([segmap])[0]
-    expected_c0 = np.float32([
-        [0, 1.0, 0],
-        [0, 1.0, 0],
-        [0, 1.0, 0]
+    segmap_aug = iaa.Affine(translate_px={"x": 1}).augment_segmentation_maps(segmap)
+    expected = np.int32([
+        [0, 0, 3],
+        [0, 0, 3],
+        [0, 0, 3]
     ])
-    expected_c1 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c2 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c3 = np.float32([
-        [0, 0, 1.0],
-        [0, 0, 1.0],
-        [0, 0, 1.0]
-    ])
-    expected = np.concatenate([
-        expected_c0[..., np.newaxis],
-        expected_c1[..., np.newaxis],
-        expected_c2[..., np.newaxis],
-        expected_c3[..., np.newaxis]
-    ], axis=2)
-    assert np.allclose(segmap_aug.arr, expected)
+    expected = expected[:, :, np.newaxis]
+    assert np.array_equal(segmap_aug.arr, expected)
 
-    segmap_aug = iaa.Pad(px=(1, 0, 0, 0), keep_size=False).augment_segmentation_maps([segmap])[0]
-    expected_c0 = np.float32([
-        [0.0, 0, 0],
-        [1.0, 0, 0],
-        [1.0, 0, 0],
-        [1.0, 0, 0]
+    segmap_aug = iaa.Pad(px=(1, 0, 0, 0), keep_size=False).augment_segmentation_maps(segmap)
+    expected = np.int32([
+        [0, 0, 0],
+        [0, 3, 3],
+        [0, 3, 3],
+        [0, 3, 3]
     ])
-    expected_c1 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c2 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c3 = np.float32([
-        [0, 0.0, 0.0],
-        [0, 1.0, 1.0],
-        [0, 1.0, 1.0],
-        [0, 1.0, 1.0]
-    ])
-    expected = np.concatenate([
-        expected_c0[..., np.newaxis],
-        expected_c1[..., np.newaxis],
-        expected_c2[..., np.newaxis],
-        expected_c3[..., np.newaxis]
-    ], axis=2)
-    assert np.allclose(segmap_aug.arr, expected)
+    expected = expected[:, :, np.newaxis]
+    assert np.array_equal(segmap_aug.arr, expected)
 
-    # all heatmaps empty
-    arr = np.float32([
+    # ---
+    # only background class
+    # ---
+    arr = np.int32([
         [0, 0, 0],
         [0, 0, 0],
         [0, 0, 0]
     ])
     arr = np.tile(arr[..., np.newaxis], (1, 1, 4))
-    segmap = ia.SegmentationMapOnImage(arr, shape=(3, 3))
-    segmap_aug = iaa.Noop().augment_segmentation_maps([segmap])[0]
-    assert np.allclose(segmap_aug.arr, segmap.arr)
-    segmap_aug = iaa.Add(10).augment_segmentation_maps([segmap])[0]
-    assert np.allclose(segmap_aug.arr, segmap.arr)
+    segmap = ia.SegmentationMapsOnImage(arr, shape=(3, 3))
+    segmap_aug = iaa.Noop().augment_segmentation_maps(segmap)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
+    segmap_aug = iaa.Add(10).augment_segmentation_maps(segmap)
+    assert np.array_equal(segmap_aug.arr, segmap.arr)
 
-    segmap_aug = iaa.Affine(translate_px={"x":1}).augment_segmentation_maps([segmap])[0]
-    expected_c0 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c1 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c2 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c3 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected = np.concatenate([
-        expected_c0[..., np.newaxis],
-        expected_c1[..., np.newaxis],
-        expected_c2[..., np.newaxis],
-        expected_c3[..., np.newaxis]
-    ], axis=2)
-    assert np.allclose(segmap_aug.arr, expected)
+    segmap_aug = iaa.Affine(translate_px={"x": 1}).augment_segmentation_maps(segmap)
+    assert np.allclose(segmap_aug.arr, arr)
 
     segmap_aug = iaa.Pad(px=(1, 0, 0, 0), keep_size=False).augment_segmentation_maps([segmap])[0]
-    expected_c0 = np.float32([
+    expected = np.int32([
         [0, 0, 0],
         [0, 0, 0],
         [0, 0, 0],
         [0, 0, 0]
     ])
-    expected_c1 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c2 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected_c3 = np.float32([
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0]
-    ])
-    expected = np.concatenate([
-        expected_c0[..., np.newaxis],
-        expected_c1[..., np.newaxis],
-        expected_c2[..., np.newaxis],
-        expected_c3[..., np.newaxis]
-    ], axis=2)
+    expected = expected[:, :, np.newaxis]
     assert np.allclose(segmap_aug.arr, expected)
 
-    # single instance of segmentation map as input
-    segmap = ia.SegmentationMapOnImage(
+    # ---
+    # (H,W,C) input array
+    # ---
+    segmap = ia.SegmentationMapsOnImage(
         np.arange(0, 4*4).reshape((4, 4, 1)).astype(np.int32),
-        shape=(4, 4, 3),
-        nb_classes=4*4
+        shape=(4, 4, 3)
     )
-
-    aug = iaa.Noop()
-    segmap_aug = aug.augment_segmentation_maps(segmap)
-    assert np.allclose(segmap_aug.arr, segmap.arr)
-
-    aug = iaa.Rot90(1, keep_size=False)
-    segmap_aug = aug.augment_segmentation_maps(segmap)
-    assert np.allclose(segmap_aug.arr, np.rot90(segmap.arr, -1))
 
     aug = iaa.Rot90(1, keep_size=False)
     segmaps_aug = aug.augment_segmentation_maps([segmap, segmap, segmap])
     for i in range(3):
         assert np.allclose(segmaps_aug[i].arr, np.rot90(segmap.arr, -1))
+
+
+def test_Augmenter_augment():
+    reseed()
+
+    image = ia.quokka((128, 128), extract="square")
+    heatmaps = ia.quokka_heatmap((128, 128), extract="square")
+    segmaps = ia.quokka_segmentation_map((128, 128), extract="square")
+    keypoints = ia.quokka_keypoints((128, 128), extract="square")
+    bbs = ia.quokka_bounding_boxes((128, 128), extract="square")
+    polygons = ia.quokka_polygons((128, 128), extract="square")
+
+    aug = iaa.Noop()
+
+    image_aug = aug.augment(image=image)
+    assert image_aug.shape == image.shape
+    assert np.array_equal(image, image_aug)
+
+    images_aug, heatmaps_aug = aug.augment(images=[image], heatmaps=[heatmaps])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+
+    images_aug, segmaps_aug = aug.augment(images=[image],
+                                          segmentation_maps=[segmaps])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(segmaps_aug[0].arr, segmaps.arr)
+
+    images_aug, keypoints_aug = aug.augment(images=[image],
+                                            keypoints=[keypoints])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+
+    images_aug, bbs_aug = aug.augment(images=[image], bounding_boxes=[bbs])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(bbs_aug[0].to_xyxy_array(), bbs.to_xyxy_array())
+
+    images_aug, polygons_aug = aug.augment(images=[image], polygons=[polygons])
+    assert np.array_equal(images_aug[0], image)
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # batch
+    batch = aug.augment(image=image, return_batch=True)
+    image_aug = batch.images_aug[0]
+    assert np.array_equal(image, image_aug)
+
+    batch = aug.augment(images=[image], heatmaps=[heatmaps], return_batch=True)
+    images_aug = batch.images_aug
+    heatmaps_aug = batch.heatmaps_aug
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+
+    batch = aug.augment(images=[image], segmentation_maps=[segmaps],
+                        return_batch=True)
+    images_aug = batch.images_aug
+    segmaps_aug = batch.segmentation_maps_aug
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(segmaps_aug[0].arr, segmaps.arr)
+
+    batch = aug.augment(images=[image], keypoints=[keypoints],
+                        return_batch=True)
+    images_aug = batch.images_aug
+    keypoints_aug = batch.keypoints_aug
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+
+    batch = aug.augment(images=[image], bounding_boxes=[bbs],
+                        return_batch=True)
+    images_aug = batch.images_aug
+    bbs_aug = batch.bounding_boxes_aug
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(bbs_aug[0].to_xyxy_array(), bbs.to_xyxy_array())
+
+    batch = aug.augment(images=[image], polygons=[polygons],
+                        return_batch=True)
+    images_aug = batch.images_aug
+    polygons_aug = batch.polygons_aug
+    assert np.array_equal(images_aug[0], image)
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    batch = aug.augment(segmentation_maps=[segmaps], keypoints=[keypoints],
+                        polygons=[polygons], return_batch=True)
+    segmaps_aug = batch.segmentation_maps_aug
+    keypoints_aug = batch.keypoints_aug
+    polygons_aug = batch.polygons_aug
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(segmaps_aug[0].arr, segmaps.arr)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    batch = aug.augment(polygons=[polygons], segmentation_maps=[segmaps],
+                        keypoints=[keypoints], return_batch=True)
+    segmaps_aug = batch.segmentation_maps_aug
+    keypoints_aug = batch.keypoints_aug
+    polygons_aug = batch.polygons_aug
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(segmaps_aug[0].arr, segmaps.arr)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # ----------------------------------------------
+    # make sure that augment actually does something
+    # ----------------------------------------------
+    aug = iaa.Affine(translate_px={"x": 1}, order=0, mode="constant", cval=0)
+    image = np.zeros((4, 4, 1), dtype=np.uint8) + 255
+    heatmaps = np.ones((1, 4, 4, 1), dtype=np.float32)
+    segmaps = np.ones((1, 4, 4, 1), dtype=np.int32)
+    kps = [(0, 0), (1, 2)]
+    bbs = [(0, 0, 1, 1), (1, 2, 2, 3)]
+    polygons = [(0, 0), (1, 0), (1, 1)]
+
+    image_aug = aug.augment(image=image)
+    _, heatmaps_aug = aug.augment(image=image, heatmaps=heatmaps)
+    _, segmaps_aug = aug.augment(image=image, segmentation_maps=segmaps)
+    _, kps_aug = aug.augment(image=image, keypoints=kps)
+    _, bbs_aug = aug.augment(image=image, bounding_boxes=bbs)
+    _, polygons_aug = aug.augment(image=image, polygons=polygons)
+    # all augmentables must have been moved to the right by 1px
+    assert np.all(image_aug[:, 0] == 0)
+    assert np.all(image_aug[:, 1:] == 255)
+    assert np.allclose(heatmaps_aug[0][:, 0], 0.0)
+    assert np.allclose(heatmaps_aug[0][:, 1:], 1.0)
+    assert np.all(segmaps_aug[0][:, 0] == 0)
+    assert np.all(segmaps_aug[0][:, 1:] == 1)
+    assert kps_aug == [(1, 0), (2, 2)]
+    assert bbs_aug == [(1, 0, 2, 1), (2, 2, 3, 3)]
+    assert polygons_aug == [(1, 0), (2, 0), (2, 1)]
+
+    # ----------------------------------------------
+    # make sure that changes from augment() are aligned and for each call
+    # ----------------------------------------------
+    aug = iaa.Affine(translate_px={"x": (0, 100)}, order=0, mode="constant",
+                     cval=0)
+    image = np.zeros((1, 100, 1), dtype=np.uint8) + 255
+    heatmaps = np.ones((1, 1, 100, 1), dtype=np.float32)
+    segmaps = np.ones((1, 1, 100, 1), dtype=np.int32)
+    kps = [(0, 0)]
+    bbs = [(0, 0, 1, 1)]
+    polygons = [(0, 0), (1, 0), (1, 1)]
+
+    seen = []
+    for _ in range(10):
+        batch_aug = aug.augment(image=image, heatmaps=heatmaps,
+                                segmentation_maps=segmaps, keypoints=kps,
+                                bounding_boxes=bbs, polygons=polygons,
+                                return_batch=True)
+        shift_image = np.sum(batch_aug.images_aug[0][0, :] == 0)
+        shift_heatmaps = np.sum(
+            np.isclose(batch_aug.heatmaps_aug[0][0, :, 0], 0.0))
+        shift_segmaps = np.sum(
+            batch_aug.segmentation_maps_aug[0][0, :, 0] == 0)
+        shift_kps = batch_aug.keypoints_aug[0][0]
+        shift_bbs = batch_aug.bounding_boxes_aug[0][0]
+        shift_polygons = batch_aug.polygons_aug[0][0]
+
+        assert len({shift_image, shift_heatmaps, shift_segmaps,
+                    shift_kps, shift_bbs, shift_polygons}) == 1
+        seen.append(shift_image)
+    assert len(set(seen)) > 7
+
+    # ----------------------------------------------
+    # make sure that changes from augment() are aligned
+    # and do NOT vary if the augmenter was already in deterministic mode
+    # ----------------------------------------------
+    aug = iaa.Affine(translate_px={"x": (0, 100)}, order=0, mode="constant",
+                     cval=0)
+    aug = aug.to_deterministic()
+
+    image = np.zeros((1, 100, 1), dtype=np.uint8) + 255
+    heatmaps = np.ones((1, 1, 100, 1), dtype=np.float32)
+    segmaps = np.ones((1, 1, 100, 1), dtype=np.int32)
+    kps = [(0, 0)]
+    bbs = [(0, 0, 1, 1)]
+    polygons = [(0, 0), (1, 0), (1, 1)]
+
+    seen = []
+    for _ in range(10):
+        batch_aug = aug.augment(image=image, heatmaps=heatmaps,
+                                segmentation_maps=segmaps, keypoints=kps,
+                                bounding_boxes=bbs, polygons=polygons,
+                                return_batch=True)
+        shift_image = np.sum(batch_aug.images_aug[0][0, :] == 0)
+        shift_heatmaps = np.sum(
+            np.isclose(batch_aug.heatmaps_aug[0][0, :, 0], 0.0))
+        shift_segmaps = np.sum(
+            batch_aug.segmentation_maps_aug[0][0, :, 0] == 0)
+        shift_kps = batch_aug.keypoints_aug[0][0]
+        shift_bbs = batch_aug.bounding_boxes_aug[0][0]
+        shift_polygons = batch_aug.polygons_aug[0][0]
+
+        assert len({shift_image, shift_heatmaps, shift_segmaps,
+                    shift_kps, shift_bbs, shift_polygons}) == 1
+        seen.append(shift_image)
+    assert len(set(seen)) == 1
+
+    # -------------------------------------------------------------------------
+    # make sure that arrays (of images, heatmaps, segmaps) get split to lists
+    # of arrays if the augmenter changes shapes in non-uniform (between images)
+    # ways
+    # we augment 100 images here with rotation of either 0deg or 90deg
+    # and do not resize back to the original image size afterwards, so shapes
+    # change
+    # -------------------------------------------------------------------------
+    aug = iaa.Rot90([0, 1], keep_size=False)
+
+    # base_arr is (100, 1, 2) array, each containing [[0, 1]]
+    base_arr = np.tile(np.arange(1*2).reshape((1, 2))[np.newaxis, :, :],
+                       (100, 1, 1))
+    images = np.copy(base_arr)[:, :, :, np.newaxis].astype(np.uint8)
+    heatmaps = (
+        np.copy(base_arr)[:, :, :, np.newaxis].astype(np.float32)
+        / np.max(base_arr)
+    )
+    segmaps = np.copy(base_arr)[:, :, :, np.newaxis].astype(np.int32)
+
+    batch_aug = aug.augment(images=images, heatmaps=heatmaps,
+                            segmentation_maps=segmaps,
+                            return_batch=True)
+    assert isinstance(batch_aug.images_aug, list)
+    assert isinstance(batch_aug.heatmaps_aug, list)
+    assert isinstance(batch_aug.segmentation_maps_aug, list)
+    shapes_images = [arr.shape for arr in batch_aug.images_aug]
+    shapes_heatmaps = [arr.shape for arr in batch_aug.heatmaps_aug]
+    shapes_segmaps = [arr.shape for arr in batch_aug.segmentation_maps_aug]
+    assert (
+        [shape[0:2] for shape in shapes_images]
+        == [shape[0:2] for shape in shapes_heatmaps]
+        == [shape[0:2] for shape in shapes_segmaps]
+    )
+    assert len(set(shapes_images)) == 2
+
+
+def test_Augmenter_augment_py36_or_higher():
+    is_py36_or_higher = (sys.version_info[0] == 3 and sys.version_info[1] >= 6)
+    if not is_py36_or_higher:
+        return
+
+    reseed()
+
+    image = ia.quokka((128, 128), extract="square")
+    heatmaps = ia.quokka_heatmap((128, 128), extract="square")
+    segmaps = ia.quokka_segmentation_map((128, 128), extract="square")
+    keypoints = ia.quokka_keypoints((128, 128), extract="square")
+    bbs = ia.quokka_bounding_boxes((128, 128), extract="square")
+    polygons = ia.quokka_polygons((128, 128), extract="square")
+
+    aug = iaa.Noop()
+
+    # two outputs, none of them 'images'
+    # this should work in py3.6+
+    keypoints_aug, polygons_aug = aug.augment(keypoints=[keypoints],
+                                              polygons=[polygons])
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # two inputs as in version-agnostic test, but now in inverted order
+    heatmaps_aug, images_aug = aug.augment(heatmaps=[heatmaps],
+                                           images=[image])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+
+    segmaps_aug, images_aug = aug.augment(segmentation_maps=[segmaps],
+                                          images=[image])
+    assert np.array_equal(images_aug[0], image)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+
+    keypoints_aug, images_aug = aug.augment(keypoints=[keypoints],
+                                            images=[image])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+
+    bbs_aug, images_aug = aug.augment(bounding_boxes=[bbs], images=[image])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(bbs_aug[0].to_xyxy_array(), bbs.to_xyxy_array())
+
+    polygons_aug, images_aug = aug.augment(polygons=[polygons], images=[image])
+    assert np.array_equal(images_aug[0], image)
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    polygons_aug, keypoints_aug = aug.augment(polygons=[polygons],
+                                              keypoints=[keypoints])
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # three inputs, expected order
+    images_aug, heatmaps_aug, segmaps_aug = aug.augment(
+        images=[image], heatmaps=[heatmaps], segmentation_maps=[segmaps])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+
+    segmaps_aug, keypoints_aug, polygons_aug = aug.augment(
+        segmentation_maps=[segmaps], keypoints=[keypoints], polygons=[polygons])
+    assert np.array_equal(images_aug[0], image)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # three inputs, inverted order
+    segmaps_aug, heatmaps_aug, images_aug = aug.augment(
+        segmentation_maps=[segmaps], heatmaps=[heatmaps], images=[image])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+
+    polygons_aug, keypoints_aug, segmaps_aug = aug.augment(
+        polygons=[polygons], keypoints=[keypoints], segmentation_maps=[segmaps])
+    assert np.array_equal(images_aug[0], image)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # all inputs, expected order
+    images_aug, heatmaps_aug, segmentation_maps, keypoints_aug, bbs_aug, \
+        polygons_aug = aug.augment(images=[image],
+                                   heatmaps=[heatmaps],
+                                   segmentation_maps=[segmaps],
+                                   keypoints=[keypoints],
+                                   bounding_boxes=[bbs],
+                                   polygons=[polygons])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    assert np.allclose(bbs_aug[0].to_xyxy_array(), bbs.to_xyxy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+    # all inputs, inverted order
+    polygons_aug, bbs_aug, keypoints_aug, segmentation_maps, heatmaps_aug, \
+        images_aug = aug.augment(polygons=[polygons],
+                                 bounding_boxes=[bbs],
+                                 keypoints=[keypoints],
+                                 segmentation_maps=[segmaps],
+                                 heatmaps=[heatmaps],
+                                 images=[image])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+    assert np.array_equal(segmaps_aug[0].arr, segmaps.arr)
+    assert np.allclose(keypoints_aug[0].to_xy_array(),
+                       keypoints.to_xy_array())
+    assert np.allclose(bbs_aug[0].to_xyxy_array(), bbs.to_xyxy_array())
+    for polygon_aug, polygon in zip(polygons_aug[0].polygons,
+                                    polygons.polygons):
+        assert polygon_aug.exterior_almost_equals(polygon)
+
+
+def test_Augmenter_augment_py35_or_lower():
+    is_py36_or_higher = (sys.version_info[0] == 3 and sys.version_info[1] >= 6)
+    if is_py36_or_higher:
+        return
+
+    reseed()
+
+    image = ia.quokka((128, 128), extract="square")
+    heatmaps = ia.quokka_heatmap((128, 128), extract="square")
+    segmaps = ia.quokka_segmentation_map((128, 128), extract="square")
+    keypoints = ia.quokka_keypoints((128, 128), extract="square")
+    bbs = ia.quokka_bounding_boxes((128, 128), extract="square")
+    polygons = ia.quokka_polygons((128, 128), extract="square")
+
+    aug = iaa.Noop()
+
+    got_exception = False
+    try:
+        _ = aug.augment(keypoints=[keypoints], polygons=[polygons])
+    except Exception as exc:
+        msg = "Requested two outputs from augment() that were not 'images'"
+        assert msg in str(exc)
+        got_exception = True
+    assert got_exception
+
+    got_exception = False
+    try:
+        _ = aug.augment(images=[image], heatmaps=[heatmaps],
+                        segmentation_maps=[segmaps])
+    except Exception as exc:
+        assert "Requested more than two outputs" in str(exc)
+        got_exception = True
+    assert got_exception
+
+
+def test_Augmenter___call__():
+    image = ia.quokka(size=(128, 128), extract="square")
+    heatmaps = ia.quokka_heatmap(size=(128, 128), extract="square")
+    images_aug, heatmaps_aug = iaa.Noop()(images=[image], heatmaps=[heatmaps])
+    assert np.array_equal(images_aug[0], image)
+    assert np.allclose(heatmaps_aug[0].arr_0to1, heatmaps.arr_0to1)
+
+
+def test_Augmenter_pool():
+    augseq = iaa.Noop()
+
+    mock_Pool = mock.MagicMock()
+    mock_Pool.return_value = mock_Pool
+    mock_Pool.__enter__.return_value = None
+    mock_Pool.__exit__.return_value = None
+    with mock.patch("imgaug.multicore.Pool", mock_Pool):
+        with augseq.pool(processes=2, maxtasksperchild=10, seed=17):
+            pass
+
+    assert mock_Pool.call_count == 1
+    assert mock_Pool.__enter__.call_count == 1
+    assert mock_Pool.__exit__.call_count == 1
+    assert mock_Pool.call_args[0][0] == augseq
+    assert mock_Pool.call_args[1]["processes"] == 2
+    assert mock_Pool.call_args[1]["maxtasksperchild"] == 10
+    assert mock_Pool.call_args[1]["seed"] == 17
 
 
 def test_Augmenter_find():
@@ -2468,10 +3403,14 @@ def test_Sequential():
     images_lr_ud_list = [image_lr_ud]
     images_lr_ud = np.array([image_lr_ud])
 
-    keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0), ia.Keypoint(x=2, y=0),
-                                      ia.Keypoint(x=2, y=1)], shape=image.shape)]
-    keypoints_aug = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=2), ia.Keypoint(x=0, y=2),
-                                          ia.Keypoint(x=0, y=1)], shape=image.shape)]
+    keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0),
+                                      ia.Keypoint(x=2, y=0),
+                                      ia.Keypoint(x=2, y=1)],
+                                     shape=image.shape)]
+    keypoints_aug = [ia.KeypointsOnImage([ia.Keypoint(x=3-1, y=3-0),
+                                          ia.Keypoint(x=3-2, y=3-0),
+                                          ia.Keypoint(x=3-2, y=3-1)],
+                                         shape=image.shape)]
 
     polygons = [
         ia.PolygonsOnImage(
@@ -2480,7 +3419,7 @@ def test_Sequential():
     ]
     polygons_aug = [
         ia.PolygonsOnImage(
-            [ia.Polygon([(2, 2), (0, 2), (0, 0), (2, 0)])],
+            [ia.Polygon([(3-0, 3-0), (3-2, 3-0), (3-2, 3-2), (3-0, 3-2)])],
             shape=image.shape)
     ]
 
@@ -2535,7 +3474,19 @@ def test_Sequential():
     assert observed.shape == (3, 3, 3)
     assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
     assert 1.0 - 1e-6 < observed.max_value < 1.0 + 1e-6
-    assert np.array_equal(observed.get_arr(), heatmaps_arr_expected)
+    assert np.allclose(observed.get_arr(), heatmaps_arr_expected)
+
+    # segmaps
+    segmaps_arr = np.int32([[0, 0, 1],
+                            [0, 0, 1],
+                            [0, 1, 1]])
+    segmaps_arr_expected = np.int32([[1, 1, 0],
+                                     [1, 0, 0],
+                                     [1, 0, 0]])
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))])[0]
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.get_arr(), segmaps_arr_expected)
 
     # 50% horizontal flip, 50% vertical flip
     aug = iaa.Sequential([
@@ -2592,6 +3543,13 @@ def test_Sequential():
     heatmaps_arr_second_first = (heatmaps_arr * 0.5) + 0.1
     heatmaps = ia.HeatmapsOnImage(heatmaps_arr, shape=(3, 3, 3))
 
+    segmaps_arr = np.int32([[0, 1, 1],
+                            [0, 0, 1],
+                            [0, 0, 1]])
+    segmaps_arr_first_second = (segmaps_arr + 1) * 4
+    segmaps_arr_second_first = (segmaps_arr * 4) + 1
+    segmaps = SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))
+
     keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=0, y=0)], shape=image.shape)]
     keypoints_first_second = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=1)], shape=image.shape)]
     keypoints_second_first = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0)], shape=image.shape)]
@@ -2622,6 +3580,16 @@ def test_Sequential():
             heatmaps_i.arr_0to1 *= 0.5
         return heatmaps
 
+    def segmaps_first(segmaps, random_state, parents, hooks):
+        for segmaps_i in segmaps:
+            segmaps_i.arr += 1
+        return segmaps
+
+    def segmaps_second(segmaps, random_state, parents, hooks):
+        for segmaps_i in segmaps:
+            segmaps_i.arr *= 4
+        return segmaps
+
     def keypoints_first(keypoints_on_images, random_state, parents, hooks):
         for keypoints_on_image in keypoints_on_images:
             for keypoint in keypoints_on_image.keypoints:
@@ -2650,11 +3618,13 @@ def test_Sequential():
         iaa.Lambda(
             func_images=images_first,
             func_heatmaps=heatmaps_first,
+            func_segmentation_maps=segmaps_first,
             func_keypoints=keypoints_first,
             func_polygons=polygons_first),
         iaa.Lambda(
             func_images=images_second,
             func_heatmaps=heatmaps_second,
+            func_segmentation_maps=segmaps_second,
             func_keypoints=keypoints_second,
             func_polygons=polygons_second)
     ], random_order=False)
@@ -2663,11 +3633,13 @@ def test_Sequential():
         iaa.Lambda(
             func_images=images_first,
             func_heatmaps=heatmaps_first,
+            func_segmentation_maps=segmaps_first,
             func_keypoints=keypoints_first,
             func_polygons=polygons_first),
         iaa.Lambda(
             func_images=images_second,
             func_heatmaps=heatmaps_second,
+            func_segmentation_maps=segmaps_second,
             func_keypoints=keypoints_second,
             func_polygons=polygons_second)
     ], random_order=True)
@@ -2691,6 +3663,10 @@ def test_Sequential():
     nb_heatmaps_second_first_unrandom = 0
     nb_heatmaps_first_second_random = 0
     nb_heatmaps_second_first_random = 0
+    nb_segmaps_first_second_unrandom = 0
+    nb_segmaps_second_first_unrandom = 0
+    nb_segmaps_first_second_random = 0
+    nb_segmaps_second_first_random = 0
     nb_keypoints_first_second_unrandom = 0
     nb_keypoints_second_first_unrandom = 0
     nb_keypoints_first_second_random = 0
@@ -2708,6 +3684,9 @@ def test_Sequential():
 
         heatmaps_aug_unrandom = aug_unrandom.augment_heatmaps([heatmaps])[0]
         heatmaps_aug_random = aug_random.augment_heatmaps([heatmaps])[0]
+
+        segmaps_aug_unrandom = aug_unrandom.augment_segmentation_maps([segmaps])[0]
+        segmaps_aug_random = aug_random.augment_segmentation_maps([segmaps])[0]
 
         keypoints_aug_unrandom = aug_unrandom.augment_keypoints(keypoints)
         keypoints_aug_random = aug_random.augment_keypoints(keypoints)
@@ -2762,6 +3741,20 @@ def test_Sequential():
         else:
             raise Exception("Received output doesnt match any expected output.")
 
+        if np.array_equal(segmaps_aug_unrandom.get_arr(), segmaps_arr_first_second):
+            nb_segmaps_first_second_unrandom += 1
+        elif np.array_equal(segmaps_aug_unrandom.get_arr(), segmaps_arr_second_first):
+            nb_segmaps_second_first_unrandom += 1
+        else:
+            raise Exception("Received output doesnt match any expected output.")
+
+        if np.array_equal(segmaps_aug_random.get_arr(), segmaps_arr_first_second):
+            nb_segmaps_first_second_random += 1
+        elif np.array_equal(segmaps_aug_random.get_arr(), segmaps_arr_second_first):
+            nb_segmaps_second_first_random += 1
+        else:
+            raise Exception("Received output doesnt match any expected output.")
+
         if keypoints_equal(keypoints_aug_unrandom, keypoints_first_second):
             nb_keypoints_first_second_unrandom += 1
         elif keypoints_equal(keypoints_aug_unrandom, keypoints_second_first):
@@ -2802,6 +3795,8 @@ def test_Sequential():
     assert nb_images_second_first_unrandom == 0
     assert nb_heatmaps_first_second_unrandom == nb_iterations
     assert nb_heatmaps_second_first_unrandom == 0
+    assert nb_segmaps_first_second_unrandom == nb_iterations
+    assert nb_segmaps_second_first_unrandom == 0
     assert nb_keypoints_first_second_unrandom == nb_iterations
     assert nb_keypoints_second_first_unrandom == 0
     assert (0.50 - 0.1) <= nb_images_first_second_random / nb_iterations <= (0.50 + 0.1)
@@ -2833,9 +3828,38 @@ def test_Sequential():
             seen[1] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
+
+    # random order for segmaps
+    # TODO this is now already tested above via lamdba functions?
+    aug = iaa.Sequential([
+        iaa.Affine(translate_px={"x": 1}),
+        iaa.Fliplr(1.0)
+    ], random_order=True)
+    segmaps_arr = np.int32([[0, 0, 1],
+                            [0, 0, 1],
+                            [0, 1, 1]])
+    segmaps_arr_expected1 = np.int32([[0, 0, 0],
+                                      [0, 0, 0],
+                                      [1, 0, 0]])
+    segmaps_arr_expected2 = np.int32([[0, 1, 0],
+                                      [0, 1, 0],
+                                      [0, 1, 1]])
+    seen = [False, False]
+    for _ in sm.xrange(100):
+        observed = aug.augment_segmentation_maps([
+            SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))])[0]
+        if np.array_equal(observed.get_arr(), segmaps_arr_expected1):
+            seen[0] = True
+        elif np.array_equal(observed.get_arr(), segmaps_arr_expected2):
+            seen[1] = True
+        else:
+            assert False
+        if np.all(seen):
+            break
+    assert np.all(seen)
 
     # None as children
     aug = iaa.Sequential(children=None)
@@ -3071,7 +4095,9 @@ def test_SomeOf():
     assert psoi_aug.shape == (5, 6, 3)
 
     # basic heatmaps test
-    augs = [iaa.Affine(translate_px={"x":1}), iaa.Affine(translate_px={"x":1}), iaa.Affine(translate_px={"x":1})]
+    augs = [iaa.Affine(translate_px={"x": 1}),
+            iaa.Affine(translate_px={"x": 1}),
+            iaa.Affine(translate_px={"x": 1})]
     heatmaps_arr = np.float32([[1.0, 0.0, 0.0],
                                [1.0, 0.0, 0.0],
                                [1.0, 0.0, 0.0]])
@@ -3092,12 +4118,42 @@ def test_SomeOf():
     observed1 = iaa.SomeOf(n=1, children=augs).augment_heatmaps([heatmaps])[0]
     observed2 = iaa.SomeOf(n=2, children=augs).augment_heatmaps([heatmaps])[0]
     observed3 = iaa.SomeOf(n=3, children=augs).augment_heatmaps([heatmaps])[0]
-    assert all([obs.shape == (3, 3, 3) for obs in [observed0, observed1, observed2, observed3]])
-    assert all([0 - 1e-6 < obs.min_value < 0 + 1e-6 for obs in [observed0, observed1, observed2, observed3]])
-    assert all([1 - 1e-6 < obs.max_value < 1 + 1e-6 for obs in [observed0, observed1, observed2, observed3]])
+    assert np.all([obs.shape == (3, 3, 3) for obs in [observed0, observed1, observed2, observed3]])
+    assert np.all([0 - 1e-6 < obs.min_value < 0 + 1e-6 for obs in [observed0, observed1, observed2, observed3]])
+    assert np.all([1 - 1e-6 < obs.max_value < 1 + 1e-6 for obs in [observed0, observed1, observed2, observed3]])
     obs_lst = [observed0, observed1, observed2, observed3]
     heatmaps_lst = [heatmaps_arr0, heatmaps_arr1, heatmaps_arr2, heatmaps_arr3]
     for obs, exp in zip(obs_lst, heatmaps_lst):
+        assert np.allclose(obs.get_arr(), exp)
+
+    # basic segmaps test
+    augs = [iaa.Affine(translate_px={"x": 1}),
+            iaa.Affine(translate_px={"x": 1}),
+            iaa.Affine(translate_px={"x": 1})]
+    segmaps_arr = np.int32([[1, 0, 0],
+                            [1, 0, 0],
+                            [1, 0, 0]])
+    segmaps_arr0 = np.int32([[1, 0, 0],
+                             [1, 0, 0],
+                             [1, 0, 0]])
+    segmaps_arr1 = np.int32([[0, 1, 0],
+                             [0, 1, 0],
+                             [0, 1, 0]])
+    segmaps_arr2 = np.int32([[0, 0, 1],
+                             [0, 0, 1],
+                             [0, 0, 1]])
+    segmaps_arr3 = np.int32([[0, 0, 0],
+                             [0, 0, 0],
+                             [0, 0, 0]])
+    segmaps = SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))
+    observed0 = iaa.SomeOf(n=0, children=augs).augment_segmentation_maps([segmaps])[0]
+    observed1 = iaa.SomeOf(n=1, children=augs).augment_segmentation_maps([segmaps])[0]
+    observed2 = iaa.SomeOf(n=2, children=augs).augment_segmentation_maps([segmaps])[0]
+    observed3 = iaa.SomeOf(n=3, children=augs).augment_segmentation_maps([segmaps])[0]
+    assert np.all([obs.shape == (3, 3, 3) for obs in [observed0, observed1, observed2, observed3]])
+    obs_lst = [observed0, observed1, observed2, observed3]
+    segmaps_lst = [segmaps_arr0, segmaps_arr1, segmaps_arr2, segmaps_arr3]
+    for obs, exp in zip(obs_lst, segmaps_lst):
         assert np.array_equal(obs.get_arr(), exp)
 
     # n as tuple
@@ -3182,9 +4238,9 @@ def test_SomeOf():
             seen[3] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
 
     # images and polygons aligned?
     img = np.zeros((3, 3), dtype=np.uint8)
@@ -3226,9 +4282,9 @@ def test_SomeOf():
             seen[3] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
 
     # invalid argument for children
     got_exception = False
@@ -3309,19 +4365,19 @@ def test_SomeOf():
     for _ in sm.xrange(10):
         observed = aug.augment_images(np.uint8([image, image, image, image]))
         assert isinstance(observed, list)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image, image, image, image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_images(np.uint8([image]))
         assert isinstance(observed, list)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_image(image)
         assert ia.is_np_array(image)
@@ -3336,19 +4392,19 @@ def test_SomeOf():
     for _ in sm.xrange(10):
         observed = aug.augment_images(np.uint8([image, image, image, image]))
         assert ia.is_np_array(observed)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image, image, image, image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images(np.uint8([image]))
         assert ia.is_np_array(observed)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_image(image)
         assert ia.is_np_array(observed)
@@ -3490,21 +4546,27 @@ def test_Sometimes():
     images_ud_list = [image_ud]
     images_ud = np.array([image_ud])
 
-    keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0), ia.Keypoint(x=2, y=0),
-                                      ia.Keypoint(x=2, y=1)], shape=image.shape)]
-    keypoints_lr = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0), ia.Keypoint(x=0, y=0),
-                                         ia.Keypoint(x=0, y=1)], shape=image.shape)]
-    keypoints_ud = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=2), ia.Keypoint(x=2, y=2),
-                                         ia.Keypoint(x=2, y=1)], shape=image.shape)]
+    keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=0),
+                                      ia.Keypoint(x=2, y=0),
+                                      ia.Keypoint(x=2, y=1)],
+                                     shape=image.shape)]
+    keypoints_lr = [ia.KeypointsOnImage([ia.Keypoint(x=3-1, y=0),
+                                         ia.Keypoint(x=3-2, y=0),
+                                         ia.Keypoint(x=3-2, y=1)],
+                                        shape=image.shape)]
+    keypoints_ud = [ia.KeypointsOnImage([ia.Keypoint(x=1, y=3-0),
+                                         ia.Keypoint(x=2, y=3-0),
+                                         ia.Keypoint(x=2, y=3-1)],
+                                        shape=image.shape)]
 
     polygons = [ia.PolygonsOnImage(
         [ia.Polygon([(0, 0), (2, 0), (2, 2)])],
         shape=image.shape)]
     polygons_lr = [ia.PolygonsOnImage(
-        [ia.Polygon([(2, 0), (0, 0), (0, 2)])],
+        [ia.Polygon([(3-0, 0), (3-2, 0), (3-2, 2)])],
         shape=image.shape)]
     polygons_ud = [ia.PolygonsOnImage(
-        [ia.Polygon([(0, 2), (2, 2), (2, 0)])],
+        [ia.Polygon([(0, 3-0), (2, 3-0), (2, 3-2)])],
         shape=image.shape)]
 
     heatmaps_arr = np.float32([[0.0, 0.0, 1.0],
@@ -3513,6 +4575,13 @@ def test_Sometimes():
     heatmaps_arr_lr = np.fliplr(heatmaps_arr)
     heatmaps_arr_ud = np.flipud(heatmaps_arr)
     heatmaps = ia.HeatmapsOnImage(heatmaps_arr, shape=(3, 3, 3))
+
+    segmaps_arr = np.int32([[0, 0, 1],
+                            [0, 0, 1],
+                            [0, 1, 1]])
+    segmaps_arr_lr = np.fliplr(segmaps_arr)
+    segmaps_arr_ud = np.flipud(segmaps_arr)
+    segmaps = SegmentationMapsOnImage(segmaps_arr, shape=(3, 3, 3))
 
     # 100% chance of if-branch
     aug = iaa.Sometimes(1.0, [iaa.Fliplr(1.0)], [iaa.Flipud(1.0)])
@@ -3560,6 +4629,12 @@ def test_Sometimes():
     assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
     assert np.array_equal(observed.get_arr(), heatmaps_arr_lr)
 
+    # 100% chance of if-branch, segmaps
+    aug = iaa.Sometimes(1.0, [iaa.Fliplr(1.0)], [iaa.Flipud(1.0)])
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    assert observed.shape == segmaps.shape
+    assert np.array_equal(observed.get_arr(), segmaps_arr_lr)
+
     # 100% chance of else-branch
     aug = iaa.Sometimes(0.0, [iaa.Fliplr(1.0)], [iaa.Flipud(1.0)])
     aug_det = aug.to_deterministic()
@@ -3604,6 +4679,12 @@ def test_Sometimes():
     assert observed.shape == heatmaps.shape
     assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
     assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
+    assert np.array_equal(observed.get_arr(), heatmaps_arr_ud)
+
+    # 100% chance of else-branch, segmaps
+    aug = iaa.Sometimes(0.0, [iaa.Fliplr(1.0)], [iaa.Flipud(1.0)])
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    assert observed.shape == segmaps.shape
     assert np.array_equal(observed.get_arr(), heatmaps_arr_ud)
 
     # 50% if branch, 50% else branch
@@ -3851,20 +4932,20 @@ def test_Sometimes():
         observed = aug.augment_images(np.uint8([image, image, image, image]))
         assert isinstance(observed, list) \
             or (ia.is_np_array(observed) and len(set([img.shape for img in observed])) == 1)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image, image, image, image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_images(np.uint8([image]))
         assert isinstance(observed, list) \
             or (ia.is_np_array(observed) and len(set([img.shape for img in observed])) == 1)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(4, 8, 3), (6, 8, 3)] for img in observed])
 
         observed = aug.augment_image(image)
         assert ia.is_np_array(image)
@@ -3880,20 +4961,20 @@ def test_Sometimes():
         observed = aug.augment_images(np.uint8([image, image, image, image]))
         assert isinstance(observed, list) \
             or (ia.is_np_array(observed) and len(set([img.shape for img in observed])) == 1)
-        assert all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
+        assert np.all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
 
         observed = aug.augment_images([image, image, image, image])
         assert isinstance(observed, list)
-        assert all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
+        assert np.all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
 
         observed = aug.augment_images(np.uint8([image]))
         assert isinstance(observed, list) \
             or (ia.is_np_array(observed) and len(set([img.shape for img in observed])) == 1)
-        assert all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
+        assert np.all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
 
         observed = aug.augment_images([image])
         assert isinstance(observed, list)
-        assert all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
+        assert np.all([16 <= img.shape[0] <= 30 and img.shape[1:] == (32, 3) for img in observed])
 
         observed = aug.augment_image(image)
         assert ia.is_np_array(image)
@@ -3908,19 +4989,19 @@ def test_Sometimes():
     for _ in sm.xrange(10):
         observed = aug.augment_images(np.uint8([image, image, image, image]))
         assert ia.is_np_array(observed)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image, image, image, image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images(np.uint8([image]))
         assert ia.is_np_array(observed)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_image(image)
         assert ia.is_np_array(observed)
@@ -3935,19 +5016,19 @@ def test_Sometimes():
     for _ in sm.xrange(10):
         observed = aug.augment_images(np.uint8([image, image, image, image]))
         assert ia.is_np_array(observed)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image, image, image, image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images(np.uint8([image]))
         assert ia.is_np_array(observed)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_images([image])
         assert isinstance(observed, list)
-        assert all([img.shape in [(8, 8, 3)] for img in observed])
+        assert np.all([img.shape in [(8, 8, 3)] for img in observed])
 
         observed = aug.augment_image(image)
         assert ia.is_np_array(observed)
@@ -4000,9 +5081,9 @@ def test_Sometimes():
             seen[1] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
 
     for dtype in [np.uint8, np.uint16, np.uint32, np.uint64, np.int8, np.int32, np.int64]:
         min_value, center_value, max_value = iadt.get_value_range_of_dtype(dtype)
@@ -4022,9 +5103,9 @@ def test_Sometimes():
                 seen[1] = True
             else:
                 assert False
-            if all(seen):
+            if np.all(seen):
                 break
-        assert all(seen)
+        assert np.all(seen)
 
     for dtype, value in zip([np.float16, np.float32, np.float64, np.float128],
                             [5000, 1000 ** 2, 1000 ** 3, 1000 ** 4]):
@@ -4043,9 +5124,9 @@ def test_Sometimes():
                 seen[1] = True
             else:
                 assert False
-            if all(seen):
+            if np.all(seen):
                 break
-        assert all(seen)
+        assert np.all(seen)
 
 
 def test_WithChannels():
@@ -4113,6 +5194,52 @@ def test_WithChannels():
     observed = aug.augment_image(base_img)
     expected = np.copy(base_img)
     assert np.array_equal(observed, expected)
+
+    # test heatmap aug
+    heatmap_arr = np.float32([
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0]
+    ])
+    heatmap_arr_shifted = np.float32([
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0]
+    ])
+    heatmap = HeatmapsOnImage(heatmap_arr, shape=(3, 3, 3))
+
+    aug = iaa.WithChannels(1, children=[iaa.Affine(translate_px={"x": 1})])
+    heatmap_aug = aug.augment_heatmaps(heatmap)
+    assert heatmap_aug.shape == (3, 3, 3)
+    assert np.allclose(heatmap_aug.get_arr(), heatmap_arr)
+
+    aug = iaa.WithChannels([0, 1, 2], children=[iaa.Affine(translate_px={"x": 1})])
+    heatmap_aug = aug.augment_heatmaps(heatmap)
+    assert heatmap_aug.shape == (3, 3, 3)
+    assert np.allclose(heatmap_aug.get_arr(), heatmap_arr_shifted)
+
+    # test segmap aug
+    segmap_arr = np.int32([
+        [0, 0, 1],
+        [0, 1, 1],
+        [1, 1, 1]
+    ])
+    segmap_arr_shifted = np.int32([
+        [0, 0, 0],
+        [0, 0, 1],
+        [0, 1, 1]
+    ])
+    segmap = SegmentationMapsOnImage(segmap_arr, shape=(3, 3, 3))
+
+    aug = iaa.WithChannels(1, children=[iaa.Affine(translate_px={"x": 1})])
+    segmap_aug = aug.augment_segmentation_maps(segmap)
+    assert segmap_aug.shape == (3, 3, 3)
+    assert np.array_equal(segmap_aug.get_arr(), segmap_arr)
+
+    aug = iaa.WithChannels([0, 1, 2], children=[iaa.Affine(translate_px={"x": 1})])
+    segmap_aug = aug.augment_segmentation_maps(segmap)
+    assert segmap_aug.shape == (3, 3, 3)
+    assert np.array_equal(segmap_aug.get_arr(), segmap_arr_shifted)
 
     # test keypoint aug
     kpsoi = ia.KeypointsOnImage([ia.Keypoint(x=0, y=0), ia.Keypoint(x=1, y=2)], shape=(5, 6, 3))
@@ -4288,9 +5415,9 @@ def test_ChannelShuffle():
             seen[1] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
 
     # p=0
     aug = iaa.ChannelShuffle(p=0)
@@ -4315,9 +5442,9 @@ def test_ChannelShuffle():
             seen[1] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
 
     # check p parsing
     aug = iaa.ChannelShuffle(p=0.9, channels=[0, 2])
@@ -4338,6 +5465,14 @@ def test_ChannelShuffle():
     assert hm_aug.shape == (4, 4, 3)
     assert hm_aug.arr_0to1.shape == (1, 3, 1)
     assert np.allclose(hm.arr_0to1, hm_aug.arr_0to1)
+
+    # segmaps may not change
+    aug = iaa.ChannelShuffle(p=1.0)
+    segmap = SegmentationMapsOnImage(np.int32([[0, 1, 2]]), shape=(4, 4, 3))
+    segmap_aug = aug.augment_segmentation_maps([segmap])[0]
+    assert segmap_aug.shape == (4, 4, 3)
+    assert segmap_aug.arr.shape == (1, 3, 1)
+    assert np.array_equal(segmap.arr, segmap_aug.arr)
 
     # keypoints may not change
     aug = iaa.ChannelShuffle(p=1.0)
@@ -4376,9 +5511,9 @@ def test_ChannelShuffle():
             seen[1] = True
         else:
             assert False
-        if all(seen):
+        if np.all(seen):
             break
-    assert all(seen)
+    assert np.all(seen)
 
     for dtype in [np.uint8, np.uint16, np.uint32, np.uint64, np.int8, np.int32, np.int64]:
         min_value, center_value, max_value = iadt.get_value_range_of_dtype(dtype)
@@ -4398,9 +5533,9 @@ def test_ChannelShuffle():
                 seen[1] = True
             else:
                 assert False
-            if all(seen):
+            if np.all(seen):
                 break
-        assert all(seen)
+        assert np.all(seen)
 
     for dtype, value in zip([np.float16, np.float32, np.float64, np.float128],
                             [5000, 1000 ** 2, 1000 ** 3, 1000 ** 4]):
@@ -4419,9 +5554,9 @@ def test_ChannelShuffle():
                 seen[1] = True
             else:
                 assert False
-            if all(seen):
+            if np.all(seen):
                 break
-        assert all(seen)
+        assert np.all(seen)
 
 
 def test_2d_inputs():
@@ -4472,230 +5607,6 @@ def test_2d_inputs():
 
     observed = noaug.augment_images(images_list2d3d)
     assert array_equal_lists(observed, images_list2d3d)
-
-
-def test_Augmenter_augment_batches():
-    reseed()
-
-    image = np.array([[0, 0, 1, 1],
-                      [0, 0, 1, 1],
-                      [0, 1, 1, 1]], dtype=np.uint8)
-    image_flipped = np.fliplr(image)
-    keypoint = ia.Keypoint(x=2, y=1)
-    keypoints = [ia.KeypointsOnImage([keypoint], shape=image.shape + (1,))]
-    kp_flipped = ia.Keypoint(
-        x=image.shape[1]-1-keypoint.x,
-        y=keypoint.y
-    )
-
-    # basic functionality test (images as list)
-    for bg in [True, False]:
-        seq = iaa.Fliplr(1.0)
-        batches = [ia.Batch(images=[np.copy(image)], keypoints=keypoints)]
-        batches_aug = list(seq.augment_batches(batches, background=bg))
-        assert np.array_equal(batches_aug[0].images_aug[0], image_flipped)
-        assert batches_aug[0].keypoints_aug[0].keypoints[0].x == kp_flipped.x
-        assert batches_aug[0].keypoints_aug[0].keypoints[0].y == kp_flipped.y
-        assert np.array_equal(batches_aug[0].images_unaug[0], image)
-        assert batches_aug[0].keypoints_unaug[0].keypoints[0].x == keypoint.x
-        assert batches_aug[0].keypoints_unaug[0].keypoints[0].y == keypoint.y
-
-    # basic functionality test (images as array)
-    for bg in [True, False]:
-        seq = iaa.Fliplr(1.0)
-        batches = [ia.Batch(images=np.uint8([np.copy(image)]), keypoints=keypoints)]
-        batches_aug = list(seq.augment_batches(batches, background=bg))
-        assert np.array_equal(batches_aug[0].images_aug, np.uint8([image_flipped]))
-        assert batches_aug[0].keypoints_aug[0].keypoints[0].x == kp_flipped.x
-        assert batches_aug[0].keypoints_aug[0].keypoints[0].y == kp_flipped.y
-        assert np.array_equal(batches_aug[0].images_unaug, np.uint8([image]))
-        assert batches_aug[0].keypoints_unaug[0].keypoints[0].x == keypoint.x
-        assert batches_aug[0].keypoints_unaug[0].keypoints[0].y == keypoint.y
-
-    """
-    seq = iaa.Fliplr(0.5)
-    # with images as list, background=False
-    nb_flipped_images = 0
-    nb_flipped_keypoints = 0
-    nb_iterations = 1000
-    batches = [ia.Batch(images=[np.copy(image)], keypoints=[keypoints[0].deepcopy()]) for _ in sm.xrange(nb_iterations)]
-    batches_aug = list(seq.augment_batches(batches, background=False))
-    for batch_aug in batches_aug:
-        image_aug = batch_aug.images_aug[0]
-        keypoint_aug = batch_aug.keypoints_aug[0].keypoints[0]
-        assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
-        if np.array_equal(image_aug, image_flipped):
-            nb_flipped_images += 1
-
-        assert (keypoint_aug.x == keypoint.x and keypoint_aug.y == keypoint.y) \
-               or (keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y)
-        if keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y:
-            nb_flipped_keypoints += 1
-    assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
-    assert nb_flipped_images == nb_flipped_keypoints
-    """
-
-    seq = iaa.Fliplr(0.5)
-    for bg in [False, True]:
-        # with images as list
-        nb_flipped_images = 0
-        nb_flipped_keypoints = 0
-        nb_iterations = 1000
-        batches = [ia.Batch(images=[np.copy(image)], keypoints=[keypoints[0].deepcopy()])
-                   for _ in sm.xrange(nb_iterations)]
-        batches_aug = list(seq.augment_batches(batches, background=bg))
-        for batch_aug in batches_aug:
-            image_aug = batch_aug.images_aug[0]
-            keypoint_aug = batch_aug.keypoints_aug[0].keypoints[0]
-            assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
-            if np.array_equal(image_aug, image_flipped):
-                nb_flipped_images += 1
-
-            assert (keypoint_aug.x == keypoint.x and keypoint_aug.y == keypoint.y) \
-                or (keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y)
-            if keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y:
-                nb_flipped_keypoints += 1
-        assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
-        assert nb_flipped_images == nb_flipped_keypoints
-
-        # with images as array
-        nb_flipped_images = 0
-        nb_iterations = 1000
-        batches = [ia.Batch(images=np.array([np.copy(image)], dtype=np.uint8), keypoints=None) for _ in sm.xrange(nb_iterations)]
-        batches_aug = list(seq.augment_batches(batches, background=bg))
-        for batch_aug in batches_aug:
-            image_aug = batch_aug.images_aug[0]
-            assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
-            if np.array_equal(image_aug, image_flipped):
-                nb_flipped_images += 1
-        assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
-
-        # array (N, H, W) as input
-        nb_flipped_images = 0
-        nb_iterations = 1000
-        batches = [np.array([np.copy(image)], dtype=np.uint8) for _ in sm.xrange(nb_iterations)]
-        batches_aug = list(seq.augment_batches(batches, background=bg))
-        for batch_aug in batches_aug:
-            image_aug = batch_aug[0]
-            assert np.array_equal(image_aug, image) or np.array_equal(image_aug, image_flipped)
-            if np.array_equal(image_aug, image_flipped):
-                nb_flipped_images += 1
-        assert 0.4*nb_iterations <= nb_flipped_images <= 0.6*nb_iterations
-
-        # list of list of KeypointsOnImage as input
-        nb_flipped_keypoints = 0
-        nb_iterations = 1000
-        batches = [[keypoints[0].deepcopy()] for _ in sm.xrange(nb_iterations)]
-        batches_aug = list(seq.augment_batches(batches, background=bg))
-        for batch_aug in batches_aug:
-            # TODO test seems to be geared here towards original data, but variable is named as "_aug"
-            keypoint_aug = batch_aug[0].keypoints[0]
-
-            assert (keypoint_aug.x == keypoint.x and keypoint_aug.y == keypoint.y) \
-                   or (keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y)
-            if keypoint_aug.x == kp_flipped.x and keypoint_aug.y == kp_flipped.y:
-                nb_flipped_keypoints += 1
-        assert 0.4*nb_iterations <= nb_flipped_keypoints <= 0.6*nb_iterations
-
-    # test all augmenters
-    # this test is currently skipped by default as it takes around 40s on its own,
-    # probably because of having to start background processes
-    """
-    augs = [
-        iaa.Sequential([iaa.Fliplr(1.0), iaa.Flipud(1.0)]),
-        iaa.SomeOf(1, [iaa.Fliplr(1.0), iaa.Flipud(1.0)]),
-        iaa.OneOf([iaa.Fliplr(1.0), iaa.Flipud(1.0)]),
-        iaa.Sometimes(1.0, iaa.Fliplr(1)),
-        iaa.WithColorspace("HSV", children=iaa.Add((-50, 50))),
-        iaa.WithChannels([0], iaa.Add((-50, 50))),
-        iaa.Noop(name="Noop-nochange"),
-        iaa.Lambda(
-            func_images=lambda images, random_state, parents, hooks: images,
-            func_keypoints=lambda keypoints_on_images, random_state, parents, hooks: keypoints_on_images,
-            name="Lambda-nochange"
-        ),
-        iaa.AssertLambda(
-            func_images=lambda images, random_state, parents, hooks: True,
-            func_keypoints=lambda keypoints_on_images, random_state, parents, hooks: True,
-            name="AssertLambda-nochange"
-        ),
-        iaa.AssertShape(
-            (None, 64, 64, 3),
-            check_keypoints=False,
-            name="AssertShape-nochange"
-        ),
-        iaa.Resize((0.5, 0.9)),
-        iaa.CropAndPad(px=(-50, 50)),
-        iaa.Pad(px=(1, 50)),
-        iaa.Crop(px=(1, 50)),
-        iaa.Fliplr(1.0),
-        iaa.Flipud(1.0),
-        iaa.Superpixels(p_replace=(0.25, 1.0), n_segments=(16, 128)),
-        iaa.ChangeColorspace(to_colorspace="GRAY"),
-        iaa.Grayscale(alpha=(0.1, 1.0)),
-        iaa.GaussianBlur(1.0),
-        iaa.AverageBlur(5),
-        iaa.MedianBlur(5),
-        iaa.Convolve(np.array([[0, 1, 0],
-                               [1, -4, 1],
-                               [0, 1, 0]])),
-        iaa.Sharpen(alpha=(0.1, 1.0), lightness=(0.8, 1.2)),
-        iaa.Emboss(alpha=(0.1, 1.0), strength=(0.8, 1.2)),
-        iaa.EdgeDetect(alpha=(0.1, 1.0)),
-        iaa.DirectedEdgeDetect(alpha=(0.1, 1.0), direction=(0.0, 1.0)),
-        iaa.Add((-50, 50)),
-        iaa.AddElementwise((-50, 50)),
-        iaa.AdditiveGaussianNoise(scale=(0.1, 1.0)),
-        iaa.Multiply((0.6, 1.4)),
-        iaa.MultiplyElementwise((0.6, 1.4)),
-        iaa.Dropout((0.3, 0.5)),
-        iaa.CoarseDropout((0.3, 0.5), size_percent=(0.05, 0.2)),
-        iaa.Invert(0.5),
-        iaa.ContrastNormalization((0.6, 1.4)),
-        iaa.Affine(scale=(0.7, 1.3), translate_percent=(-0.1, 0.1), rotate=(-20, 20),
-                   shear=(-20, 20), order=ia.ALL, mode=ia.ALL, cval=(0, 255)),
-        iaa.PiecewiseAffine(scale=(0.1, 0.3)),
-        iaa.ElasticTransformation(alpha=0.5)
-    ]
-
-    nb_iterations = 100
-    image = ia.quokka(size=(64, 64))
-    batch = ia.Batch(images=np.array([image]), keypoints=keypoints)
-    batches = [ia.Batch(images=[np.copy(image)], keypoints=[keypoints[0].deepcopy()])
-               for _ in sm.xrange(nb_iterations)]
-    for aug in augs:
-        nb_changed = 0
-        batches_aug = list(aug.augment_batches(batches, background=True))
-        for batch_aug in batches_aug:
-            image_aug = batch_aug.images_aug[0]
-            if image.shape != image_aug.shape or not np.array_equal(image, image_aug):
-                nb_changed += 1
-                if nb_changed > 10:
-                    break
-        if "-nochange" not in aug.name:
-            assert nb_changed > 0
-        else:
-            assert nb_changed == 0
-    """
-
-def test_Augmenter_pool():
-    augseq = iaa.Noop()
-
-    mock_Pool = mock.MagicMock()
-    mock_Pool.return_value = mock_Pool
-    mock_Pool.__enter__.return_value = None
-    mock_Pool.__exit__.return_value = None
-    with mock.patch("imgaug.multicore.Pool", mock_Pool):
-        with augseq.pool(processes=2, maxtasksperchild=10, seed=17):
-            pass
-
-    assert mock_Pool.call_count == 1
-    assert mock_Pool.__enter__.call_count == 1
-    assert mock_Pool.__exit__.call_count == 1
-    assert mock_Pool.call_args[0][0] == augseq
-    assert mock_Pool.call_args[1]["processes"] == 2
-    assert mock_Pool.call_args[1]["maxtasksperchild"] == 10
-    assert mock_Pool.call_args[1]["seed"] == 17
 
 
 if __name__ == "__main__":

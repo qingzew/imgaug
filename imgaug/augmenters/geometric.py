@@ -35,7 +35,8 @@ import six.moves as sm
 
 from . import meta
 from . import blur as blur_lib
-from .. import imgaug as ia
+import imgaug as ia
+from imgaug.augmentables.polys import _ConcavePolygonRecoverer
 from .. import parameters as iap
 from .. import dtypes as iadt
 
@@ -713,12 +714,19 @@ class Affine(meta.Augmenter):
             cval_samples, mode_samples, order_samples = self._draw_samples(nb_heatmaps, random_state)
         cval_samples = np.zeros((cval_samples.shape[0], 1), dtype=np.float32)
         mode_samples = ["constant"] * len(mode_samples)
+        order_samples = [3] * len(order_samples)
 
         arrs = [heatmaps_i.arr_0to1 for heatmaps_i in heatmaps]
         arrs_aug, matrices = self._augment_images_by_samples(arrs, scale_samples, translate_samples, rotate_samples,
                                                              shear_samples, cval_samples, mode_samples, order_samples,
                                                              return_matrices=True)
-        for heatmaps_i, arr_aug, matrix in zip(heatmaps, arrs_aug, matrices):
+        for heatmaps_i, arr_aug, matrix, order in zip(heatmaps, arrs_aug, matrices, order_samples):
+            # order=3 matches cubic interpolation and can cause values to go outside of the range [0.0, 1.0]
+            # not clear whether 4+ also do that
+            # TODO add test for this
+            if order >= 3:
+                arr_aug = np.clip(arr_aug, 0.0, 1.0, out=arr_aug)
+
             heatmaps_i.arr_0to1 = arr_aug
             if self.fit_output:
                 _, output_shape_i = self._tf_to_fit_output(heatmaps_i.shape, matrix)
@@ -726,6 +734,38 @@ class Affine(meta.Augmenter):
                 output_shape_i = heatmaps_i.shape
             heatmaps_i.shape = output_shape_i
         return heatmaps
+
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        nb_segmaps = len(segmaps)
+        scale_samples, translate_samples, rotate_samples, shear_samples, \
+            cval_samples, mode_samples, order_samples = self._draw_samples(nb_segmaps, random_state)
+
+        # Segmentation map augmentation always pads with a constant value
+        # of 0 (background class id), and always uses nearest neighbour
+        # interpolation. While different pad modes and BG class ids could
+        # be used, the interpolation mode has to be NN as any other mode would
+        # lead to averaging class ids, which makes no sense to do.
+        cval_samples = np.zeros((cval_samples.shape[0], 1), dtype=np.float32)
+        mode_samples = ["constant"] * len(mode_samples)
+        order_samples = [0] * len(order_samples)
+
+        arrs = [segmaps_i.arr for segmaps_i in segmaps]
+        arrs_aug, matrices = self._augment_images_by_samples(
+            arrs, scale_samples, translate_samples, rotate_samples,
+            shear_samples, cval_samples, mode_samples, order_samples,
+            return_matrices=True)
+        for segmaps_i, arr_aug, matrix, order in zip(segmaps, arrs_aug, matrices, order_samples):
+            # in contrast to heatmap aug, we don't have to clip augmented
+            # arrays here, as we always use NN interpolation
+            assert order == 0
+
+            segmaps_i.arr = arr_aug
+            if self.fit_output:
+                _, output_shape_i = self._tf_to_fit_output(segmaps_i.shape, matrix)
+            else:
+                output_shape_i = segmaps_i.shape
+            segmaps_i.shape = output_shape_i
+        return segmaps
 
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         result = []
@@ -768,7 +808,7 @@ class Affine(meta.Augmenter):
                 if len(keypoints_on_image.keypoints) == 0:
                     result.append(keypoints_on_image.deepcopy(shape=output_shape))
                 else:
-                    coords = keypoints_on_image.get_coords_array()
+                    coords = keypoints_on_image.to_xy_array()
                     coords_aug = tf.matrix_transform(coords, matrix.params)
                     kps_new = [kp.deepcopy(x=coords[0], y=coords[1])
                                for kp, coords
@@ -1458,6 +1498,20 @@ class AffineCv2(meta.Augmenter):
             heatmap_i.arr_0to1 = arr_aug
         return heatmaps
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        nb_images = len(segmaps)
+        scale_samples, translate_samples, rotate_samples, shear_samples, \
+            cval_samples, mode_samples, order_samples = self._draw_samples(nb_images, random_state)
+        cval_samples = np.zeros((cval_samples.shape[0], 1), dtype=np.float32)
+        mode_samples = ["constant"] * len(mode_samples)
+        order_samples = [0] * len(order_samples)
+        arrs = [segmaps_i.arr for segmaps_i in segmaps]
+        arrs_aug = self._augment_images_by_samples(arrs, scale_samples, translate_samples, rotate_samples,
+                                                   shear_samples, cval_samples, mode_samples, order_samples)
+        for segmaps_i, arr_aug in zip(segmaps, arrs_aug):
+            segmaps_i.arr = arr_aug
+        return segmaps
+
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         result = []
         nb_images = len(keypoints_on_images)
@@ -1497,7 +1551,7 @@ class AffineCv2(meta.Augmenter):
                 matrix_to_center = tf.SimilarityTransform(translation=[shift_x, shift_y])
                 matrix = (matrix_to_topleft + matrix_transforms + matrix_to_center)
 
-                coords = keypoints_on_image.get_coords_array()
+                coords = keypoints_on_image.to_xy_array()
                 coords_aug = tf.matrix_transform(coords, matrix.params)
                 kps_new = [kp.deepcopy(x=coords[0], y=coords[1])
                            for kp, coords
@@ -1555,12 +1609,27 @@ class AffineCv2(meta.Augmenter):
 
 class PiecewiseAffine(meta.Augmenter):
     """
-    Augmenter that places a regular grid of points on an image and randomly
+    Apply affine transformations that differ between local neighbourhoods.
+
+    This augmenter places a regular grid of points on an image and randomly
     moves the neighbourhood of these point around via affine transformations.
     This leads to local distortions.
 
-    This is mostly a wrapper around scikit-image's PiecewiseAffine.
-    See also the Affine augmenter for a similar technique.
+    This is mostly a wrapper around scikit-image's ``PiecewiseAffine``.
+    See also ``Affine`` for a similar technique.
+
+    .. note::
+
+        This augmenter is very slow. See :ref:`performance`.
+        Try to use ``ElasticTransformation`` instead, which is at least 10x
+        faster.
+
+    .. note::
+
+        For coordinate-based inputs (keypoints, bounding boxes, polygons,
+        ...), this augmenter still has to perform an image-based augmentation,
+        which will make it significantly slower for such inputs than other
+        augmenters. See :ref:`performance`.
 
     dtype support::
 
@@ -1739,7 +1808,7 @@ class PiecewiseAffine(meta.Augmenter):
         self.absolute_scale = absolute_scale
         self.polygon_recoverer = polygon_recoverer
         if polygon_recoverer == "auto":
-            self.polygon_recoverer = ia._ConcavePolygonRecoverer()
+            self.polygon_recoverer = _ConcavePolygonRecoverer()
 
     def _augment_images(self, images, random_state, parents, hooks):
         iadt.gate_dtypes(images,
@@ -1802,11 +1871,10 @@ class PiecewiseAffine(meta.Augmenter):
         result = heatmaps
         nb_images = len(heatmaps)
 
-        rss = ia.derive_random_states(random_state, nb_images+3)
+        rss = ia.derive_random_states(random_state, nb_images+2)
 
-        nb_rows_samples = self.nb_rows.draw_samples((nb_images,), random_state=rss[-3])
-        nb_cols_samples = self.nb_cols.draw_samples((nb_images,), random_state=rss[-2])
-        order_samples = self.order.draw_samples((nb_images,), random_state=rss[-1])
+        nb_rows_samples = self.nb_rows.draw_samples((nb_images,), random_state=rss[-2])
+        nb_cols_samples = self.nb_cols.draw_samples((nb_images,), random_state=rss[-1])
 
         for i in sm.xrange(nb_images):
             heatmaps_i = heatmaps[i]
@@ -1820,7 +1888,7 @@ class PiecewiseAffine(meta.Augmenter):
                 arr_0to1_warped = tf.warp(
                     arr_0to1,
                     transformer,
-                    order=order_samples[i],
+                    order=3,
                     mode="constant",
                     cval=0,
                     preserve_range=True,
@@ -1830,7 +1898,50 @@ class PiecewiseAffine(meta.Augmenter):
                 # skimage converts to float64
                 arr_0to1_warped = arr_0to1_warped.astype(np.float32)
 
+                # TODO not entirely clear whether this breaks the value range -- Affine does
+                # TODO add test for this
+                # order=3 matches cubic interpolation and can cause values to go outside of the range [0.0, 1.0]
+                # not clear whether 4+ also do that
+                arr_0to1_warped = np.clip(arr_0to1_warped, 0.0, 1.0, out=arr_0to1_warped)
+
                 heatmaps_i.arr_0to1 = arr_0to1_warped
+
+        return result
+
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        result = segmaps
+        nb_images = len(segmaps)
+
+        rss = ia.derive_random_states(random_state, nb_images+2)
+
+        nb_rows_samples = self.nb_rows.draw_samples((nb_images,),
+                                                    random_state=rss[-2])
+        nb_cols_samples = self.nb_cols.draw_samples((nb_images,),
+                                                    random_state=rss[-1])
+
+        for i in sm.xrange(nb_images):
+            segmaps_i = segmaps[i]
+            arr = segmaps_i.arr
+
+            rs_image = rss[i]
+            h, w = arr.shape[0:2]
+            transformer = self._get_transformer(
+                h, w, nb_rows_samples[i], nb_cols_samples[i], rs_image)
+
+            if transformer is not None:
+                arr_warped = tf.warp(
+                    arr,
+                    transformer,
+                    order=0,
+                    mode="constant",
+                    cval=0,
+                    preserve_range=True,
+                    output_shape=arr.shape
+                )
+
+                # skimage converts to float64
+                arr_warped = iadt.restore_dtypes_(arr_warped, arr.dtype)
+                segmaps_i.arr = arr_warped
 
         return result
 
@@ -1969,18 +2080,20 @@ class PiecewiseAffine(meta.Augmenter):
         return [self.scale, self.nb_rows, self.nb_cols, self.order, self.cval, self.mode, self.absolute_scale]
 
 
+# TODO add args for interpolation, borderMode, borderValue
 class PerspectiveTransform(meta.Augmenter):
     """
-    Augmenter that performs a random four point perspective transform.
+    Apply random four point perspective transformations to images.
 
     Each of the four points is placed on the image using a random distance from
     its respective corner. The distance is sampled from a normal distribution.
-    As a result, most transformations don't change very much, while some
-    "focus" on polygons far inside the image.
+    As a result, most transformations don't change the image very much, while
+    some "focus" on polygons far inside the image.
 
-    The results of this augmenter have some similarity with Crop.
+    The results of this augmenter have some similarity with ``Crop``.
 
-    Code partially from http://www.pyimagesearch.com/2014/08/25/4-point-opencv-getperspective-transform-example/ .
+    Code partially from
+    http://www.pyimagesearch.com/2014/08/25/4-point-opencv-getperspective-transform-example/
 
     dtype support::
 
@@ -2036,6 +2149,57 @@ class PerspectiveTransform(meta.Augmenter):
         may end up having different shapes and will always be a list, never
         an array.
 
+    cval : number or tuple of number or list of number or imaug.ALL or imgaug.parameters.StochasticParameter, optional
+        The constant value used to fill up pixels in the result image that
+        didn't exist in the input image (e.g. when translating to the left,
+        some new pixels are created at the right). Such a fill-up with a
+        constant value only happens, when `mode` is "constant".
+        The expected value range is ``[0, 255]``. It may be a float value.
+
+            * If this is a single int or float, then that value will be used
+              (e.g. 0 results in black pixels).
+            * If a tuple ``(a, b)``, then a random value from the range ``a <= x <= b``
+              is picked per image.
+            * If a list, then a random value will eb sampled from that list
+              per image.
+            * If imgaug.ALL, a value from the discrete range ``[0 .. 255]`` will be
+              sampled per image.
+            * If a StochasticParameter, a new value will be sampled from the
+              parameter per image.
+
+    mode : int or str or list of str or list of int or imgaug.ALL or imgaug.parameters.StochasticParameter,
+           optional
+        Parameter that defines the handling of newly created pixels.
+        Same meaning as in OpenCV's border mode. Let ``abcdefgh`` be an image's
+        content and ``|`` be an image boundary, then:
+
+            * ``cv2.BORDER_REPLICATE``: ``aaaaaa|abcdefgh|hhhhhhh``
+            * ``cv2.BORDER_CONSTANT``: ``iiiiii|abcdefgh|iiiiiii``, where ``i`` is the defined cval.
+            * ``replicate``: Same as ``cv2.BORDER_REPLICATE``.
+            * ``constant``: Same as ``cv2.BORDER_CONSTANT``.
+
+        The datatype of the parameter may be:
+
+            * If a single int, then it must be one of ``cv2.BORDER_*``.
+            * If a single string, then it must be one of: ``replicate``,
+              ``reflect``, ``reflect_101``, ``wrap``, ``constant``.
+            * If a list of ints/strings, then per image a random mode will be
+              picked from that list.
+            * If imgaug.ALL, then a random mode from all possible modes will be
+              picked.
+            * If StochasticParameter, then the mode will be sampled from that
+              parameter per image, i.e. it must return only the above mentioned
+              strings.
+
+    polygon_recoverer : 'auto' or None or imgaug.augmentables.polys._ConcavePolygonRecoverer, optional
+        The class to use to repair invalid polygons.
+        If ``"auto"``, a new instance of
+        ``imgaug.augmentables.polys._ConcavePolygonRecoverer`` will be created.
+        If ``None``, no polygon recoverer will be used.
+        If an object, then that object will be used and must provide a
+        ``recover_from()`` method, similar to
+        ``imgaug.augmentables.polys._ConcavePolygonRecoverer``.
+
     name : None or str, optional
         See :func:`imgaug.augmenters.meta.Augmenter.__init__`.
 
@@ -2047,16 +2211,26 @@ class PerspectiveTransform(meta.Augmenter):
 
     Examples
     --------
-    >>> aug = iaa.PerspectiveTransform(scale=(0.01, 0.10))
+    >>> import imgaug.augmenters as iaa
+    >>> aug = iaa.PerspectiveTransform(scale=(0.01, 0.15))
 
-    Applies perspective transformations using a random scale between 0.01 and
-    0.1 per image, where the scale is roughly a measure of how far the
-    perspective transform's corner points may be distanced from the original
-    image's corner points.
+    Apply perspective transformations using a random scale between ``0.01``
+    and ``0.15`` per image, where the scale is roughly a measure of how far
+    the perspective transformation's corner points may be distanced from the
+    image's corner points. Higher scale values lead to stronger "zoom-in"
+    effects (and thereby stronger distortions).
+
+    >>> aug = iaa.PerspectiveTransform(scale=(0.01, 0.15), keep_size=False)
+
+    Same as in the previous example, but images are not resized back to
+    the input image size after augmentation. This will lead to smaller
+    output images.
 
     """
 
-    def __init__(self, scale=0, keep_size=True, name=None, deterministic=False, random_state=None):
+    def __init__(self, scale=0, cval=0, mode='constant', keep_size=True,
+                 polygon_recoverer="auto",
+                 name=None, deterministic=False, random_state=None):
         super(PerspectiveTransform, self).__init__(name=name, deterministic=deterministic, random_state=random_state)
 
         self.scale = iap.handle_continuous_param(scale, "scale", value_range=(0, None), tuple_to_uniform=True,
@@ -2066,9 +2240,47 @@ class PerspectiveTransform(meta.Augmenter):
 
         # setting these to 1x1 caused problems for large scales and polygon
         # augmentation
+        # TODO there is now a recoverer for polygons - are these minima still
+        #      needed/sensible?
         self.min_width = 2
         self.min_height = 2
         self.shift_step_size = 0.5
+
+        if cval == ia.ALL:
+            self.cval = iap.DiscreteUniform(0, 255)
+        else:
+            self.cval = iap.handle_discrete_param(cval, "cval", value_range=(0, 255), tuple_to_uniform=True,
+                                                  list_to_choice=True, allow_floats=True)
+
+        available_modes = [cv2.BORDER_REPLICATE, cv2.BORDER_CONSTANT]
+        available_modes_str = ["replicate", "constant"]
+        if mode == ia.ALL:
+            self.mode = iap.Choice(available_modes)
+        elif ia.is_single_integer(mode):
+            ia.do_assert(mode in available_modes,
+                         "Expected mode to be in %s, got %d." % (str(available_modes), mode))
+            self.mode = iap.Deterministic(mode)
+        elif ia.is_string(mode):
+            ia.do_assert(mode in available_modes_str,
+                         "Expected mode to be in %s, got %s." % (str(available_modes_str), mode))
+            self.mode = iap.Deterministic(mode)
+        elif isinstance(mode, list):
+            ia.do_assert(all([ia.is_single_integer(val) or ia.is_string(val) for val in mode]),
+                         "Expected mode list to only contain integers/strings, got types %s." % (
+                             str([type(val) for val in mode]),))
+            ia.do_assert(all([val in available_modes + available_modes_str for val in mode]),
+                         "Expected all mode values to be in %s, got %s." % (
+                             str(available_modes + available_modes_str), str(mode)))
+            self.mode = iap.Choice(mode)
+        elif isinstance(mode, iap.StochasticParameter):
+            self.mode = mode
+        else:
+            raise Exception("Expected mode to be imgaug.ALL, an int, a string, a list of int/strings or "
+                            + "StochasticParameter, got %s." % (type(mode),))
+
+        self.polygon_recoverer = polygon_recoverer
+        if polygon_recoverer == "auto":
+            self.polygon_recoverer = _ConcavePolygonRecoverer()
 
     def _augment_images(self, images, random_state, parents, hooks):
         iadt.gate_dtypes(images,
@@ -2082,12 +2294,12 @@ class PerspectiveTransform(meta.Augmenter):
         if not self.keep_size:
             result = list(result)
 
-        matrices, max_heights, max_widths = self._create_matrices(
+        matrices, max_heights, max_widths, cval_samples, mode_samples = self._create_matrices(
             [image.shape for image in images],
             random_state
         )
 
-        for i, (M, max_height, max_width) in enumerate(zip(matrices, max_heights, max_widths)):
+        for i, (M, max_height, max_width, cval, mode) in enumerate(zip(matrices, max_heights, max_widths, cval_samples, mode_samples)):
             image = images[i]
 
             # cv2.warpPerspective only supports <=4 channels
@@ -2099,13 +2311,23 @@ class PerspectiveTransform(meta.Augmenter):
                 image = image.astype(np.float32)
 
             if nb_channels <= 4:
-                warped = cv2.warpPerspective(image, M, (max_width, max_height))
+                warped = cv2.warpPerspective(
+                    image,
+                    M,
+                    (max_width, max_height),
+                    borderValue=cval,
+                    borderMode=mode)
                 if warped.ndim == 2 and images[i].ndim == 3:
                     warped = np.expand_dims(warped, 2)
             else:
                 # warp each channel on its own, re-add channel axis, then stack
                 # the result from a list of [H, W, 1] to (H, W, C).
-                warped = [cv2.warpPerspective(image[..., c], M, (max_width, max_height))
+                warped = [cv2.warpPerspective(
+                    image[..., c],
+                    M,
+                    (max_width, max_height),
+                    borderValue=cval,
+                    borderMode=mode)
                           for c in sm.xrange(nb_channels)]
                 warped = [warped_i[..., np.newaxis] for warped_i in warped]
                 warped = np.dstack(warped)
@@ -2126,7 +2348,7 @@ class PerspectiveTransform(meta.Augmenter):
     def _augment_heatmaps(self, heatmaps, random_state, parents, hooks):
         result = heatmaps
 
-        matrices, max_heights, max_widths = self._create_matrices(
+        matrices, max_heights, max_widths, cval_samples, mode_samples = self._create_matrices(
             [heatmaps_i.arr_0to1.shape for heatmaps_i in heatmaps],
             ia.copy_random_state(random_state)
         )
@@ -2137,19 +2359,23 @@ class PerspectiveTransform(meta.Augmenter):
         if self.keep_size:
             max_heights_imgs, max_widths_imgs = max_heights, max_widths
         else:
-            _, max_heights_imgs, max_widths_imgs = self._create_matrices(
+            _, max_heights_imgs, max_widths_imgs, cval_samples, mode_samples = self._create_matrices(
                 [heatmaps_i.shape for heatmaps_i in heatmaps],
                 ia.copy_random_state(random_state)
             )
 
-        for i, (M, max_height, max_width) in enumerate(zip(matrices, max_heights, max_widths)):
+        for i, (M, max_height, max_width, cval, mode) in enumerate(zip(matrices, max_heights, max_widths, cval_samples, mode_samples)):
             heatmaps_i = heatmaps[i]
 
             arr = heatmaps_i.arr_0to1
 
             nb_channels = arr.shape[2]
 
-            warped = [cv2.warpPerspective(arr[..., c], M, (max_width, max_height)) for c in sm.xrange(nb_channels)]
+            warped = [cv2.warpPerspective(
+                arr[..., c], M,
+                (max_width, max_height),
+                borderValue=0,
+                borderMode=cv2.BORDER_CONSTANT) for c in sm.xrange(nb_channels)]
             warped = [warped_i[..., np.newaxis] for warped_i in warped]
             warped = np.dstack(warped)
 
@@ -2167,20 +2393,66 @@ class PerspectiveTransform(meta.Augmenter):
 
         return result
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        result = segmaps
+
+        matrices, max_heights, max_widths, _, _ = self._create_matrices(
+            [segmaps_i.arr.shape for segmaps_i in segmaps],
+            ia.copy_random_state(random_state)
+        )
+
+        # estimate max_heights/max_widths for the underlying images
+        # this is only necessary if keep_size is False as then the underlying image sizes
+        # change and we need to update them here
+        if self.keep_size:
+            max_heights_imgs, max_widths_imgs = max_heights, max_widths
+        else:
+            _, max_heights_imgs, max_widths_imgs, _, _ = self._create_matrices(
+                [segmaps_i.shape for segmaps_i in segmaps],
+                ia.copy_random_state(random_state)
+            )
+
+        for i, (M, max_height, max_width) in enumerate(zip(matrices, max_heights, max_widths)):
+            segmaps_i = segmaps[i]
+            arr = segmaps_i.arr
+
+            nb_channels = arr.shape[2]
+
+            warped = [
+                cv2.warpPerspective(arr[..., c],
+                                    M,
+                                    (max_width, max_height),
+                                    flags=cv2.INTER_NEAREST)
+                for c
+                in sm.xrange(nb_channels)
+            ]
+            warped = [warped_i[..., np.newaxis] for warped_i in warped]
+            warped = np.dstack(warped)
+
+            result[i].arr = warped
+
+            if self.keep_size:
+                h, w = arr.shape[0:2]
+                result[i] = result[i].resize((h, w))
+            else:
+                result[i].shape = (max_heights_imgs[i], max_widths_imgs[i]) + result[i].shape[2:]
+
+        return result
+
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         result = keypoints_on_images
-        matrices, max_heights, max_widths = self._create_matrices(
+        matrices, max_heights, max_widths, cval_samples, mode_samples = self._create_matrices(
             [kps.shape for kps in keypoints_on_images],
             random_state
         )
 
-        for i, (M, max_height, max_width) in enumerate(zip(matrices, max_heights, max_widths)):
+        for i, (M, max_height, max_width, cval, mode) in enumerate(zip(matrices, max_heights, max_widths, cval_samples, mode_samples)):
             keypoints_on_image = keypoints_on_images[i]
             new_shape = (max_height, max_width) + keypoints_on_image.shape[2:]
             if not keypoints_on_image.keypoints:
                 warped_kps = keypoints_on_image.deepcopy(shape=new_shape)
             else:
-                kps_arr = keypoints_on_image.get_coords_array()
+                kps_arr = keypoints_on_image.to_xy_array()
                 warped = cv2.perspectiveTransform(np.array([kps_arr], dtype=np.float32), M)
                 warped = warped[0]
                 warped_kps = [kp.deepcopy(x=coords[0], y=coords[1])
@@ -2196,17 +2468,38 @@ class PerspectiveTransform(meta.Augmenter):
 
     def _augment_polygons(self, polygons_on_images, random_state, parents,
                           hooks):
+        # large scale values cause invalid polygons (unclear why that happens),
+        # hence the recoverer
         return self._augment_polygons_as_keypoints(
-            polygons_on_images, random_state, parents, hooks)
+            polygons_on_images, random_state, parents, hooks,
+            recoverer=self.polygon_recoverer)
 
     def _create_matrices(self, shapes, random_state):
+        # TODO change these to class attributes
+        mode_str_to_int = {
+            "replicate": cv2.BORDER_REPLICATE,
+            "constant": cv2.BORDER_CONSTANT
+        }
+
         matrices = []
         max_heights = []
         max_widths = []
         nb_images = len(shapes)
         seeds = ia.copy_random_state(random_state).randint(0, 10**6, (nb_images,))
 
+        cval_samples = self.cval.draw_samples((nb_images, 3),
+                                              random_state=random_state)
+        mode_samples = self.mode.draw_samples((nb_images,),
+                                              random_state=random_state)
+
+        cval_samples_cv2 = []
+
         for i in sm.xrange(nb_images):
+            mode = mode_samples[i]
+            mode_samples[i] = mode if ia.is_single_integer(mode) else mode_str_to_int[mode]
+
+            cval_samples_cv2.append([int(cval_i) for cval_i in cval_samples[i]])
+
             h, w = shapes[i][0:2]
 
             points = self.jitter.draw_samples((4, 2), random_state=ia.new_random_state(seeds[i]))
@@ -2281,7 +2574,8 @@ class PerspectiveTransform(meta.Augmenter):
             max_heights.append(max_height)
             max_widths.append(max_width)
 
-        return matrices, max_heights, max_widths
+        mode_samples = mode_samples.astype(int)
+        return matrices, max_heights, max_widths, cval_samples_cv2, mode_samples
 
     @classmethod
     def _order_points(cls, pts):
@@ -2308,7 +2602,7 @@ class PerspectiveTransform(meta.Augmenter):
         return pts_ordered
 
     def get_parameters(self):
-        return [self.jitter, self.keep_size]
+        return [self.jitter, self.keep_size, self.cval, self.mode]
 
 
 # code partially from https://gist.github.com/chsasank/4d8f68caf01f041a6453e67fb30f8f5a
@@ -2317,19 +2611,21 @@ class PerspectiveTransform(meta.Augmenter):
 # TODO add backend arg
 class ElasticTransformation(meta.Augmenter):
     """
-    Augmenter to transform images by moving pixels locally around using displacement fields.
+    Transform images by moving pixels locally around using displacement fields.
 
-    The augmenter has the parameters ``alpha`` and ``sigma``. ``alpha`` controls the strength of the
-    displacement: higher values mean that pixels are moved further. ``sigma`` controls the
-    smoothness of the displacement: higher values lead to smoother patterns -- as if the
-    image was below water -- while low values will cause indivdual pixels to be moved very
+    The augmenter has the parameters ``alpha`` and ``sigma``. ``alpha``
+    controls the strength of the displacement: higher values mean that pixels
+    are moved further. ``sigma`` controls the smoothness of the displacement:
+    higher values lead to smoother patterns -- as if the image was below water
+    -- while low values will cause indivdual pixels to be moved very
     differently from their neighbours, leading to noisy and pixelated images.
 
-    A relation of 10:1 seems to be good for ``alpha`` and ``sigma``, e.g. ``alpha=10`` and ``sigma=1`` or
-    ``alpha=50``, ``sigma=5``. For ``128x128`` a setting of ``alpha=(0, 70.0)``, ``sigma=(4.0, 6.0)`` may be a
-    good choice and will lead to a water-like effect.
+    A relation of 10:1 seems to be good for ``alpha`` and ``sigma``, e.g.
+    ``alpha=10`` and ``sigma=1`` or ``alpha=50``, ``sigma=5``. For ``128x128``
+    a setting of ``alpha=(0, 70.0)``, ``sigma=(4.0, 6.0)`` may be a good
+    choice and will lead to a water-like effect.
 
-    See ::
+    For a detailed explanation, see ::
 
         Simard, Steinkraus and Platt
         Best Practices for Convolutional Neural Networks applied to Visual
@@ -2337,7 +2633,12 @@ class ElasticTransformation(meta.Augmenter):
         in Proc. of the International Conference on Document Analysis and
         Recognition, 2003
 
-    for a detailed explanation.
+    .. note::
+
+        For coordinate-based inputs (keypoints, bounding boxes, polygons,
+        ...), this augmenter still has to perform an image-based augmentation,
+        which will make it significantly slower for such inputs than other
+        augmenters. See :ref:`performance`.
 
     dtype support::
 
@@ -2536,7 +2837,7 @@ class ElasticTransformation(meta.Augmenter):
 
         self.polygon_recoverer = polygon_recoverer
         if polygon_recoverer == "auto":
-            self.polygon_recoverer = ia._ConcavePolygonRecoverer()
+            self.polygon_recoverer = _ConcavePolygonRecoverer()
 
     def _draw_samples(self, nb_images, random_state):
         # seeds = ia.copy_random_state(random_state).randint(0, 10**6, (nb_images+1,))
@@ -2593,7 +2894,7 @@ class ElasticTransformation(meta.Augmenter):
 
     def _augment_heatmaps(self, heatmaps, random_state, parents, hooks):
         nb_heatmaps = len(heatmaps)
-        rss, alphas, sigmas, orders, _cvals, _modes = self._draw_samples(nb_heatmaps, random_state)
+        rss, alphas, sigmas, _orders, _cvals, _modes = self._draw_samples(nb_heatmaps, random_state)
         for i in sm.xrange(nb_heatmaps):
             heatmaps_i = heatmaps[i]
             if heatmaps_i.arr_0to1.shape[0:2] == heatmaps_i.shape[0:2]:
@@ -2608,7 +2909,7 @@ class ElasticTransformation(meta.Augmenter):
                     heatmaps_i.arr_0to1,
                     dx,
                     dy,
-                    order=orders[i],
+                    order=3,
                     cval=0,
                     mode="constant"
                 )
@@ -2641,7 +2942,7 @@ class ElasticTransformation(meta.Augmenter):
                     arr_0to1,
                     dx,
                     dy,
-                    order=orders[i],
+                    order=3,
                     cval=0,
                     mode="constant"
                 )
@@ -2657,6 +2958,61 @@ class ElasticTransformation(meta.Augmenter):
                 heatmaps[i] = heatmaps_i_warped
 
         return heatmaps
+
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        nb_segmaps = len(segmaps)
+        rss, alphas, sigmas, _orders, _cvals, _modes = self._draw_samples(nb_segmaps, random_state)
+        for i in sm.xrange(nb_segmaps):
+            segmaps_i = segmaps[i]
+            if segmaps_i.arr.shape[0:2] == segmaps_i.shape[0:2]:
+                dx, dy = self.generate_shift_maps(
+                    segmaps_i.arr.shape[0:2],
+                    alpha=alphas[i],
+                    sigma=sigmas[i],
+                    random_state=rss[i]
+                )
+
+                arr_warped = self.map_coordinates(
+                    segmaps_i.arr,
+                    dx,
+                    dy,
+                    order=0,
+                    cval=0,
+                    mode="constant"
+                )
+
+                segmaps_i.arr = arr_warped
+            else:
+                # Segmaps do not have the same size as augmented images.
+                # This may result in indices of moved pixels being different.
+                # To prevent this, we use the same image size as for the base images, but that
+                # requires resizing the segmaps temporarily to the image sizes.
+                height_orig, width_orig = segmaps_i.arr.shape[0:2]
+                segmaps_i = segmaps_i.resize(segmaps_i.shape[0:2])
+                arr = segmaps_i.arr
+                dx, dy = self.generate_shift_maps(
+                    arr.shape[0:2],
+                    alpha=alphas[i],
+                    sigma=sigmas[i],
+                    random_state=rss[i]
+                )
+
+                # TODO will it produce similar results to first downscale the shift maps and then remap?
+                #      That would make the remap step take less operations and would also mean that the segmaps
+                #      wouldnt have to be scaled up anymore. It would also simplify the code as this branch could
+                #      be merged with the one above.
+                arr_warped = self.map_coordinates(
+                    arr,
+                    dx,
+                    dy,
+                    order=0,
+                    cval=0,
+                    mode="constant"
+                )
+
+                segmaps[i].arr = arr_warped
+                segmaps[i] = segmaps[i].resize((height_orig, width_orig))
+        return segmaps
 
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         result = keypoints_on_images
@@ -2925,9 +3281,10 @@ class ElasticTransformation(meta.Augmenter):
 
 class Rot90(meta.Augmenter):
     """
-    Augmenter to rotate images clockwise by multiples of 90 degrees.
+    Rotate images clockwise by multiples of 90 degrees.
 
-    This could also be achieved using ``Affine``, but Rot90 is significantly more efficient.
+    This could also be achieved using ``Affine``, but ``Rot90`` is
+    significantly more efficient.
 
     dtype support::
 
@@ -2987,28 +3344,33 @@ class Rot90(meta.Augmenter):
 
     Examples
     --------
+    >>> import imgaug.augmenters as iaa
     >>> aug = iaa.Rot90(1)
 
-    Rotates all images by 90 degrees.
-    Resizes all images afterwards to keep the size that they had before augmentation.
+    Rotate all images by 90 degrees.
+    Resize these images afterwards to keep the size that they had before
+    augmentation.
     This may cause the images to look distorted.
 
     >>> aug = iaa.Rot90([1, 3])
 
-    Rotates all images by 90 or 270 degrees.
-    Resizes all images afterwards to keep the size that they had before augmentation.
+    Rotate all images by 90 or 270 degrees.
+    Resize these images afterwards to keep the size that they had before
+    augmentation.
     This may cause the images to look distorted.
 
     >>> aug = iaa.Rot90((1, 3))
 
-    Rotates all images by 90, 180 or 270 degrees.
-    Resizes all images afterwards to keep the size that they had before augmentation.
+    Rotate all images by 90, 180 or 270 degrees.
+    Resize these images afterwards to keep the size that they had before
+    augmentation.
     This may cause the images to look distorted.
 
     >>> aug = iaa.Rot90((1, 3), keep_size=False)
 
-    Rotates all images by 90, 180 or 270 degrees.
-    Does not resize to the original image size afterwards, i.e. each image's size may change.
+    Rotate all images by 90, 180 or 270 degrees.
+    Does not resize to the original image size afterwards, i.e. each image's
+    size may change.
 
     """
 
@@ -3064,6 +3426,24 @@ class Rot90(meta.Augmenter):
             heatmaps_aug.append(heatmaps_i)
         return heatmaps_aug
 
+    def _augment_segmentation_maps(self, segmaps, random_state, parents, hooks):
+        arrs = [segmaps_i.arr for segmaps_i in segmaps]
+        arrs_aug, ks = self._augment_arrays(arrs, random_state, None)
+        segmaps_aug = []
+        for segmaps_i, arr_aug, k_i in zip(segmaps, arrs_aug, ks):
+            shape_orig = segmaps_i.arr.shape
+            segmaps_i.arr = arr_aug
+            if self.keep_size:
+                segmaps_i = segmaps_i.resize(shape_orig[0:2])
+            elif k_i % 2 == 1:
+                h, w = segmaps_i.shape[0:2]
+                segmaps_i.shape = tuple([w, h] + list(segmaps_i.shape[2:]))
+            else:
+                # keep_size was False, but rotated by a multiple of 2, hence height and width do not change
+                pass
+            segmaps_aug.append(segmaps_i)
+        return segmaps_aug
+
     def _augment_keypoints(self, keypoints_on_images, random_state, parents, hooks):
         nb_images = len(keypoints_on_images)
         ks = self._draw_samples(nb_images, random_state)
@@ -3082,9 +3462,11 @@ class Rot90(meta.Augmenter):
                     yr, xr = y, x
                     wr, hr = w, h
                     for _ in sm.xrange(k_i):
-                        # FIXME using ((hr - 1) - yr) here seems wrong for float-based coordinates, should likely be
-                        #       (hr - yr). Same problem as in horizontal flipping.
-                        xr, yr = (hr - 1) - yr, xr
+                        # for int coordinates this would instead be
+                        #   xr, yr = (hr - 1) - yr, xr
+                        # here we assume that coordinates are always
+                        # subpixel-accurate
+                        xr, yr = hr - yr, xr
                         wr, hr = hr, wr
                     kps_aug.append(kp.deepcopy(x=xr, y=yr))
 

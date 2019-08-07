@@ -14,6 +14,8 @@ import imgaug.augmenters.size as iaa_size
 from imgaug import parameters as iap
 from imgaug import dtypes as iadt
 from imgaug.testutils import array_equal_lists, keypoints_equal, reseed
+from imgaug.augmentables.heatmaps import HeatmapsOnImage
+from imgaug.augmentables.segmaps import SegmentationMapsOnImage
 
 
 def main():
@@ -155,7 +157,8 @@ def test_Resize():
     # heatmaps
     aug = iaa.Resize({"height": 8, "width": 12})
     heatmaps_arr = (base_img2d / 255.0).astype(np.float32)
-    heatmaps_aug = aug.augment_heatmaps([ia.HeatmapsOnImage(heatmaps_arr, shape=base_img3d.shape)])[0]
+    heatmaps_aug = aug.augment_heatmaps([
+        HeatmapsOnImage(heatmaps_arr, shape=base_img3d.shape)])[0]
     assert heatmaps_aug.shape == (8, 12, 3)
     assert 0 - 1e-6 < heatmaps_aug.min_value < 0 + 1e-6
     assert 1 - 1e-6 < heatmaps_aug.max_value < 1 + 1e-6
@@ -164,10 +167,28 @@ def test_Resize():
     assert np.average(heatmaps_aug.get_arr()[:, 0]) < 0.05
     assert 0.8 < np.average(heatmaps_aug.get_arr()[2:6, 2:10]) < 1 + 1e-6
 
+    # segmaps
+    for nb_channels in [None, 1, 10]:
+        aug = iaa.Resize({"height": 8, "width": 12})
+        segmaps_arr = (base_img2d > 0).astype(np.int32)
+        if nb_channels is not None:
+            segmaps_arr = np.tile(
+                segmaps_arr[..., np.newaxis], (1, 1, nb_channels))
+        segmaps_aug = aug.augment_segmentation_maps([
+            SegmentationMapsOnImage(segmaps_arr, shape=base_img3d.shape)])[0]
+        assert segmaps_aug.shape == (8, 12, 3)
+        assert segmaps_aug.arr.shape == (8, 12, nb_channels if nb_channels is not None else 1)
+        assert np.all(segmaps_aug.arr[0, 1:-1, :] == 0)
+        assert np.all(segmaps_aug.arr[-1, 1:-1, :] == 0)
+        assert np.all(segmaps_aug.arr[1:-1, 0, :] == 0)
+        assert np.all(segmaps_aug.arr[1:-1, -1, :] == 0)
+        assert np.all(segmaps_aug.arr[2:-2, 2:-2, :] == 1)
+
     # heatmaps with different sizes than image
     aug = iaa.Resize({"width": 2.0, "height": 16})
     heatmaps_arr = (base_img2d / 255.0).astype(np.float32)
-    heatmaps = ia.HeatmapsOnImage(heatmaps_arr, shape=(2*base_img3d.shape[0], 2*base_img3d.shape[1], 3))
+    heatmaps = HeatmapsOnImage(
+        heatmaps_arr, shape=(2*base_img3d.shape[0], 2*base_img3d.shape[1], 3))
     heatmaps_aug = aug.augment_heatmaps([heatmaps])[0]
     assert heatmaps_aug.shape == (16, int(base_img3d.shape[1]*2*2), 3)
     assert heatmaps_aug.arr_0to1.shape == (8, 16, 1)
@@ -177,6 +198,20 @@ def test_Resize():
     assert np.average(heatmaps_aug.get_arr()[-1:, :]) < 0.05
     assert np.average(heatmaps_aug.get_arr()[:, 0]) < 0.05
     assert 0.8 < np.average(heatmaps_aug.get_arr()[2:6, 2:10]) < 1 + 1e-6
+
+    # segmaps with different sizes than image
+    aug = iaa.Resize({"width": 2.0, "height": 16})
+    segmaps_arr = (base_img2d > 0).astype(np.int32)
+    segmaps = SegmentationMapsOnImage(
+        segmaps_arr, shape=(2*base_img3d.shape[0], 2*base_img3d.shape[1], 3))
+    segmaps_aug = aug.augment_segmentation_maps([segmaps])[0]
+    assert segmaps_aug.shape == (16, int(base_img3d.shape[1]*2*2), 3)
+    assert segmaps_aug.arr.shape == (8, 16, 1)
+    assert np.all(segmaps_aug.arr[0, 1:-1, :] == 0)
+    assert np.all(segmaps_aug.arr[-1, 1:-1, :] == 0)
+    assert np.all(segmaps_aug.arr[1:-1, 0, :] == 0)
+    assert np.all(segmaps_aug.arr[1:-1, -1, :] == 0)
+    assert np.all(segmaps_aug.arr[2:-2, 2:-2, :] == 1)
 
     # keypoints on 3d image
     aug = iaa.Resize({"height": 8, "width": 12})
@@ -267,8 +302,8 @@ def test_Resize():
             seen3d[1] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # images with stochastic parameter (uniform)
     aug = iaa.Resize((12, 14))
@@ -293,8 +328,8 @@ def test_Resize():
             seen3d[2] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # test "keep"
     aug = iaa.Resize("keep")
@@ -366,6 +401,20 @@ def test_Resize():
     assert observed2d.shape == (int(12 * (1/aspect_ratio2d)), 12)
     assert observed3d.shape == (int(12 * (1/aspect_ratio3d)), 12, 3)
 
+    # change short axis, keep long axis at same aspect ration
+    aug = iaa.Resize({"shorter-side": 6, "longer-side": "keep-aspect-ratio"})
+    observed2d = aug.augment_image(base_img2d)
+    observed3d = aug.augment_image(base_img3d)
+    assert observed2d.shape == (6, int(6 * aspect_ratio2d))
+    assert observed3d.shape == (6, int(6 * aspect_ratio3d), 3)
+
+    # change long axis, keep short axis at same aspect ration
+    aug = iaa.Resize({"longer-side": 6, "shorter-side": "keep-aspect-ratio"})
+    observed2d = aug.augment_image(base_img2d)
+    observed3d = aug.augment_image(base_img3d)
+    assert observed2d.shape == (int(6 * (1/aspect_ratio2d)), 6)
+    assert observed3d.shape == (int(6 * (1/aspect_ratio3d)), 6, 3)
+
     # change height randomly, width deterministically
     aug = iaa.Resize({"height": [12, 14], "width": 12})
     seen2d = [False, False]
@@ -385,8 +434,8 @@ def test_Resize():
             seen3d[1] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # change height deterministically, width randomly
     aug = iaa.Resize({"height": 12, "width": [12, 14]})
@@ -407,8 +456,8 @@ def test_Resize():
             seen3d[1] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # change height deterministically, width randomly
     aug = iaa.Resize({"height": 12, "width": iap.Choice([12, 14])})
@@ -429,8 +478,8 @@ def test_Resize():
             seen3d[1] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # change height randomly, width deterministically
     aug = iaa.Resize({"height": (12, 14), "width": 12})
@@ -455,8 +504,8 @@ def test_Resize():
             seen3d[2] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # increase size by a factor of 2.0
     aug = iaa.Resize(2.0)
@@ -488,8 +537,8 @@ def test_Resize():
             seen3d[1] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # increase size by a random factor
     aug = iaa.Resize(iap.Choice([2.0, 4.0]))
@@ -512,8 +561,8 @@ def test_Resize():
             seen3d[1] = True
         if all(seen2d) and all(seen3d):
             break
-    assert all(seen2d)
-    assert all(seen3d)
+    assert np.all(seen2d)
+    assert np.all(seen3d)
 
     # decrease size by a random factor
     base_img2d = base_img2d[0:4, 0:4]
@@ -601,10 +650,12 @@ def test_Pad():
 
     keypoints = [ia.KeypointsOnImage([ia.Keypoint(x=0, y=0), ia.Keypoint(x=1, y=1),
                                       ia.Keypoint(x=2, y=2)], shape=base_img.shape)]
-
     heatmaps_arr = np.float32([[0, 0, 0],
                                [0, 1.0, 0],
                                [0, 0, 0]])
+    segmaps_arr = np.int32([[0, 0, 0],
+                            [0, 1, 0],
+                            [0, 0, 0]])
 
     # test pad by 1 pixel on each side
     pads = [
@@ -634,11 +685,22 @@ def test_Pad():
         heatmaps_arr_padded = np.pad(heatmaps_arr, ((top, bottom), (left, right)),
                                      mode="constant",
                                      constant_values=0)
-        observed = aug.augment_heatmaps([ia.HeatmapsOnImage(heatmaps_arr, shape=base_img.shape)])[0]
+        observed = aug.augment_heatmaps(
+            [ia.HeatmapsOnImage(heatmaps_arr, shape=base_img.shape)])[0]
         assert observed.shape == base_img_padded.shape
         assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
         assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
         assert np.array_equal(observed.get_arr(), heatmaps_arr_padded)
+
+        # segmaps
+        aug = iaa.Pad(px=pad, keep_size=False)
+        segmaps_arr_padded = np.pad(segmaps_arr, ((top, bottom), (left, right)),
+                                    mode="constant",
+                                    constant_values=0)
+        observed = aug.augment_segmentation_maps(
+            [SegmentationMapsOnImage(segmaps_arr, shape=base_img.shape)])[0]
+        assert observed.shape == base_img_padded.shape
+        assert np.array_equal(observed.get_arr(), segmaps_arr_padded)
 
     # test pad by range of pixels
     pads = [
@@ -772,6 +834,27 @@ def test_Pad():
     assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
     assert np.allclose(observed.arr_0to1[..., 0], heatmaps_arr_small_padded)
 
+    # pad smaller segmaps
+    # same sizes and paddings as above
+    aug = iaa.Pad(px=(2, 4, 2, 4), keep_size=False)
+    segmaps_arr_small = np.int32([
+        [0, 0, 0, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 0, 0, 0]
+    ])
+    top, bottom, left, right = 2, 2, 1, 1
+    segmaps_arr_small_padded = np.pad(segmaps_arr_small, ((top, bottom), (left, right)),
+                                      mode="constant",
+                                      constant_values=0)
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(6, 16))])[0]
+    assert observed.shape == (10, 24)
+    assert observed.arr.shape == (10, 6, 1)
+    assert np.array_equal(observed.arr[..., 0], segmaps_arr_small_padded)
+
     # pad smaller heatmaps, with keep_size=True
     # heatmap is (6, 4), image is (6, 16)
     # image is padded by (2, 4, 2, 4)
@@ -801,6 +884,31 @@ def test_Pad():
             ia.imresize_single_image(heatmaps_arr_small_padded, (6, 4), interpolation="cubic"),
             0, 1.0
         )
+    )
+
+    # pad smaller segmaps, with keep_size=True
+    # same sizes and paddings as above
+    aug = iaa.Pad(px=(2, 4, 2, 4), keep_size=True)
+    segmaps_arr_small = np.int32([
+        [0, 0, 0, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 0, 0, 0]
+    ])
+    top, bottom, left, right = 2, 2, 1, 1
+    segmaps_arr_small_padded = np.pad(segmaps_arr_small, ((top, bottom), (left, right)),
+                                      mode="constant",
+                                      constant_values=0)
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(6, 16))])[0]
+    assert observed.shape == (6, 16)
+    assert observed.arr.shape == (6, 4, 1)
+    assert np.array_equal(
+        observed.arr[..., 0],
+        ia.imresize_single_image(
+            segmaps_arr_small_padded, (6, 4), interpolation="nearest"),
     )
 
     # keypoints
@@ -881,20 +989,20 @@ def test_Pad():
             seen[2] += 1
         else:
             assert False
-    assert all([100 - 50 < v < 100 + 50 for v in seen])
+    assert np.all([100 - 50 < v < 100 + 50 for v in seen])
 
     aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode=ia.ALL, pad_cval=0, keep_size=False)
     expected = ["constant", "edge", "linear_ramp", "maximum", "mean", "median", "minimum", "reflect",
                 "symmetric", "wrap"]
     assert isinstance(aug.pad_mode, iap.Choice)
     assert len(aug.pad_mode.a) == len(expected)
-    assert all([v in aug.pad_mode.a for v in expected])
+    assert np.all([v in aug.pad_mode.a for v in expected])
 
     aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode=["constant", "maximum"], pad_cval=0, keep_size=False)
     expected = ["constant", "maximum"]
     assert isinstance(aug.pad_mode, iap.Choice)
     assert len(aug.pad_mode.a) == len(expected)
-    assert all([v in aug.pad_mode.a for v in expected])
+    assert np.all([v in aug.pad_mode.a for v in expected])
 
     got_exception = False
     try:
@@ -904,11 +1012,19 @@ def test_Pad():
         got_exception = True
     assert got_exception
 
-    # pad modes, heatmaps
-    heatmaps = ia.HeatmapsOnImage(np.ones((3, 3, 1), dtype=np.float32), shape=(3, 3, 3))
+    # pad modes, heatmaps (always uses constant padding)
+    heatmaps = HeatmapsOnImage(
+        np.ones((3, 3, 1), dtype=np.float32), shape=(3, 3, 3))
     aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="edge", pad_cval=0, keep_size=False)
     observed = aug.augment_heatmaps([heatmaps])[0]
     assert np.sum(observed.get_arr() <= 1e-4) == 3
+
+    # pad modes, segmaps (always uses constant padding)
+    segmaps = SegmentationMapsOnImage(
+        np.ones((3, 3, 1), dtype=np.int32), shape=(3, 3, 3))
+    aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="edge", pad_cval=0, keep_size=False)
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    assert np.sum(observed.get_arr() == 0) == 3
 
     # pad cvals
     aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="constant", pad_cval=100, keep_size=False)
@@ -927,13 +1043,13 @@ def test_Pad():
             seen[1] += 1
         else:
             assert False
-    assert all([100 - 50 < v < 100 + 50 for v in seen])
+    assert np.all([100 - 50 < v < 100 + 50 for v in seen])
 
     aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="constant", pad_cval=[50, 100], keep_size=False)
     expected = [50, 100]
     assert isinstance(aug.pad_cval, iap.Choice)
     assert len(aug.pad_cval.a) == len(expected)
-    assert all([v in aug.pad_cval.a for v in expected])
+    assert np.all([v in aug.pad_cval.a for v in expected])
 
     image = np.zeros((1, 1), dtype=np.uint8)
     aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="constant", pad_cval=(50, 52), keep_size=False)
@@ -948,21 +1064,31 @@ def test_Pad():
             seen[2] += 1
         else:
             assert False
-    assert all([100 - 50 < v < 100 + 50 for v in seen])
+    assert np.all([100 - 50 < v < 100 + 50 for v in seen])
 
     got_exception = False
     try:
-        aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="constant", pad_cval="test", keep_size=False)
+        _aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="constant", pad_cval="test", keep_size=False)
     except Exception as exc:
         assert "Expected " in str(exc)
         got_exception = True
     assert got_exception
 
-    # pad cvals, heatmaps
-    heatmaps = ia.HeatmapsOnImage(np.zeros((3, 3, 1), dtype=np.float32), shape=(3, 3, 3))
-    aug = iaa.Pad(px=(0, 1, 0, 0), pad_mode="constant", pad_cval=255, keep_size=False)
+    # pad cvals, heatmaps (should always use cval 0)
+    heatmaps = HeatmapsOnImage(
+        np.zeros((3, 3, 1), dtype=np.float32), shape=(3, 3, 3))
+    aug = iaa.Pad(
+        px=(0, 1, 0, 0), pad_mode="constant", pad_cval=255, keep_size=False)
     observed = aug.augment_heatmaps([heatmaps])[0]
     assert np.sum(observed.get_arr() > 1e-4) == 0
+
+    # pad cvals, segmaps (should always use cval 0)
+    segmaps = SegmentationMapsOnImage(
+        np.zeros((3, 3, 1), dtype=np.int32), shape=(3, 3, 3))
+    aug = iaa.Pad(
+        px=(0, 1, 0, 0), pad_mode="constant", pad_cval=255, keep_size=False)
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    assert np.sum(observed.get_arr() > 0) == 0
 
     # ------------------
     # pad by percentages
@@ -1054,6 +1180,27 @@ def test_Pad():
     assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
     assert np.allclose(observed.arr_0to1[..., 0], heatmaps_arr_small_padded)
 
+    # pad smaller segmaps
+    # same sizes and paddings as above
+    aug = iaa.Pad(percent=(0.5, 0.25, 0.5, 0.25), keep_size=False)
+    segmaps_arr_small = np.int32([
+        [0, 0, 0, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 0, 0, 0]
+    ])
+    top, bottom, left, right = 3, 3, 1, 1
+    segmaps_arr_small_padded = np.pad(segmaps_arr_small, ((top, bottom), (left, right)),
+                                      mode="constant",
+                                      constant_values=0)
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(6, 16))])[0]
+    assert observed.shape == (12, 24)
+    assert observed.arr.shape == (12, 6, 1)
+    assert np.array_equal(observed.arr[..., 0], segmaps_arr_small_padded)
+
     # pad smaller heatmaps, with keep_size=True
     # heatmap is (6, 4), image is (6, 16)
     # image is padded by (0.5, 0.25, 0.5, 0.25)
@@ -1083,6 +1230,31 @@ def test_Pad():
             ia.imresize_single_image(heatmaps_arr_small_padded, (6, 4), interpolation="cubic"),
             0, 1.0
         )
+    )
+
+    # pad smaller segmaps, with keep_size=True
+    # same sizes and paddings as above
+    aug = iaa.Pad(percent=(0.5, 0.25, 0.5, 0.25), keep_size=True)
+    segmaps_arr_small = np.int32([
+        [0, 0, 0, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+        [0, 0, 0, 0]
+    ])
+    top, bottom, left, right = 3, 3, 1, 1
+    segmaps_arr_small_padded = np.pad(segmaps_arr_small, ((top, bottom), (left, right)),
+                                      mode="constant",
+                                      constant_values=0)
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(6, 16))])[0]
+    assert observed.shape == (6, 16)
+    assert observed.arr.shape == (6, 4, 1)
+    assert np.array_equal(
+        observed.arr[..., 0],
+        ia.imresize_single_image(
+            segmaps_arr_small_padded, (6, 4), interpolation="nearest")
     )
 
     # keypoints
@@ -1161,7 +1333,7 @@ def test_Pad():
     # and 4px) padding have half the probability of occuring compared to the other values.
     # E.g. 0px is padded if sampled p falls in range [0, 0.125). 1px is padded if sampled p
     # falls in range [0.125, 0.375].
-    assert all([v > 30 for v in seen])
+    assert np.all([v > 30 for v in seen])
 
     aug = iaa.Pad(percent=(0, (0, 1.0), 0, 0), keep_size=False)
     seen = [0, 0, 0, 0, 0]
@@ -1172,7 +1344,7 @@ def test_Pad():
             n_padded += 1
             observed = observed[:, 0:-1]
         seen[n_padded] += 1
-    assert all([v > 30 for v in seen])
+    assert np.all([v > 30 for v in seen])
 
     # test pad by list of percentages
     aug = iaa.Pad(percent=([0.0, 1.0], 0, 0, 0), keep_size=False)
@@ -1281,6 +1453,9 @@ def test_Crop():
     heatmaps_arr = np.float32([[0, 0, 0],
                                [0, 1.0, 0],
                                [0, 0, 0]])
+    segmaps_arr = np.int32([[0, 0, 0],
+                            [0, 1, 0],
+                            [0, 0, 0]])
 
     # test crop by 1 pixel on each side
     crops = [
@@ -1311,6 +1486,14 @@ def test_Crop():
         assert observed.shape == base_img_cropped.shape
         assert np.array_equal(observed.get_arr(), heatmaps_arr_cropped)
 
+        height, width = segmaps_arr.shape[0:2]
+        aug = iaa.Crop(px=crop, keep_size=False)
+        segmaps_arr_cropped = segmaps_arr[top:height-bottom, left:width-right]
+        observed = aug.augment_segmentation_maps(
+            [SegmentationMapsOnImage(segmaps_arr, shape=base_img.shape)])[0]
+        assert observed.shape == base_img_cropped.shape
+        assert np.array_equal(observed.get_arr(), segmaps_arr_cropped)
+
     # test crop by range of pixels
     crops = [
         ((0, 2), 0, 0, 0),
@@ -1334,7 +1517,6 @@ def test_Crop():
             for right_val in sm.xrange(right_range[0], right_range[1]+1):
                 for bottom_val in sm.xrange(bottom_range[0], bottom_range[1]+1):
                     for left_val in sm.xrange(left_range[0], left_range[1]+1):
-
                         images_cropped.append(base_img[top_val:height-bottom_val, left_val:width-right_val, :])
                         keypoints_cropped.append(keypoints[0].shift(x=-left_val, y=-top_val))
 
@@ -1425,12 +1607,25 @@ def test_Crop():
     heatmaps_arr_small[1:-1, 1:-1] = 1.0
     top, bottom, left, right = 1, 1, 2, 2
     heatmaps_arr_small_cropped = heatmaps_arr_small[top:-bottom, left:-right]
-    observed = aug.augment_heatmaps([ia.HeatmapsOnImage(heatmaps_arr_small, shape=(6, 16))])[0]
+    observed = aug.augment_heatmaps([HeatmapsOnImage(heatmaps_arr_small, shape=(6, 16))])[0]
     assert observed.shape == (4, 8)
     assert observed.arr_0to1.shape == (4, 4, 1)
     assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
     assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
     assert np.allclose(observed.arr_0to1[..., 0], heatmaps_arr_small_cropped)
+
+    # crop smaller segmaps
+    # same sizes and crops as above
+    aug = iaa.Crop(px=(1, 4, 1, 4), keep_size=False)
+    segmaps_arr_small = np.zeros((6, 8), dtype=np.int32)
+    segmaps_arr_small[1:-1, 1:-1] = 1
+    top, bottom, left, right = 1, 1, 2, 2
+    segmaps_arr_small_cropped = segmaps_arr_small[top:-bottom, left:-right]
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(6, 16))])[0]
+    assert observed.shape == (4, 8)
+    assert observed.arr.shape == (4, 4, 1)
+    assert np.array_equal(observed.arr[..., 0], segmaps_arr_small_cropped)
 
     # crop smaller heatmaps, with keep_size=True
     # heatmap is (6, 8), image is (6, 16)
@@ -1442,7 +1637,7 @@ def test_Crop():
     heatmaps_arr_small[1:-1, 1:-1] = 1.0
     top, bottom, left, right = 1, 1, 2, 2
     heatmaps_arr_small_cropped = heatmaps_arr_small[top:-bottom, left:-right]
-    observed = aug.augment_heatmaps([ia.HeatmapsOnImage(heatmaps_arr_small, shape=(6, 16))])[0]
+    observed = aug.augment_heatmaps([HeatmapsOnImage(heatmaps_arr_small, shape=(6, 16))])[0]
     assert observed.shape == (6, 16)
     assert observed.arr_0to1.shape == (6, 8, 1)
     assert 0 - 1e-6 < observed.min_value < 0 + 1e-6
@@ -1453,6 +1648,22 @@ def test_Crop():
             ia.imresize_single_image(heatmaps_arr_small_cropped, (6, 8), interpolation="cubic"),
             0, 1.0
         )
+    )
+
+    # crop smaller segmaps, with keep_size=True
+    # same sizes and crops as above
+    aug = iaa.Crop(px=(1, 4, 1, 4), keep_size=True)
+    segmaps_arr_small = np.zeros((6, 8), dtype=np.int32)
+    segmaps_arr_small[1:-1, 1:-1] = 1
+    top, bottom, left, right = 1, 1, 2, 2
+    segmaps_arr_small_cropped = segmaps_arr_small[top:-bottom, left:-right]
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(6, 16))])[0]
+    assert observed.shape == (6, 16)
+    assert observed.arr.shape == (6, 8, 1)
+    assert np.array_equal(
+        observed.arr[..., 0],
+        ia.imresize_single_image(segmaps_arr_small_cropped, (6, 8), interpolation="nearest"),
     )
 
     # keypoints
@@ -1594,6 +1805,19 @@ def test_Crop():
     assert 1 - 1e-6 < observed.max_value < 1 + 1e-6
     assert np.allclose(observed.arr_0to1[..., 0], heatmaps_arr_small_cropped)
 
+    # crop smaller segmaps
+    # same sizes and crops as above
+    aug = iaa.Crop(percent=(0.25, 0.25, 0.25, 0.25), keep_size=False)
+    segmaps_arr_small = np.zeros((8, 12), dtype=np.int32)
+    segmaps_arr_small[2:-2, 4:-4] = 1
+    top, bottom, left, right = 2, 2, 3, 3
+    segmaps_arr_small_cropped = segmaps_arr_small[top:-bottom, left:-right]
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(16, 32))])[0]
+    assert observed.shape == (8, 16)
+    assert observed.arr.shape == (4, 6, 1)
+    assert np.array_equal(observed.arr[..., 0], segmaps_arr_small_cropped)
+
     # crop smaller heatmaps, with keep_size=True
     # heatmap is (8, 12), image is (16, 32)
     # image is cropped by (0.25, 0.25, 0.25, 0.25)
@@ -1615,6 +1839,22 @@ def test_Crop():
             ia.imresize_single_image(heatmaps_arr_small_cropped, (8, 12), interpolation="cubic"),
             0, 1.0
         )
+    )
+
+    # crop smaller segmaps, with keep_size=True
+    # same sizes and crops as above
+    aug = iaa.Crop(percent=(0.25, 0.25, 0.25, 0.25), keep_size=True)
+    segmaps_arr_small = np.zeros((8, 12), dtype=np.int32)
+    segmaps_arr_small[2:-2, 4:-4] = 1
+    top, bottom, left, right = 2, 2, 3, 3
+    segmaps_arr_small_cropped = segmaps_arr_small[top:-bottom, left:-right]
+    observed = aug.augment_segmentation_maps(
+        [SegmentationMapsOnImage(segmaps_arr_small, shape=(16, 32))])[0]
+    assert observed.shape == (16, 32)
+    assert observed.arr.shape == (8, 12, 1)
+    assert np.allclose(
+        observed.arr[..., 0],
+        ia.imresize_single_image(segmaps_arr_small_cropped, (8, 12), interpolation="nearest")
     )
 
     # keypoints
@@ -1690,7 +1930,7 @@ def test_Crop():
     # and 4px) have half the probability of occuring compared to the other values.
     # E.g. 0px is cropped if sampled p falls in range [0, 0.125). 1px is cropped if sampled p
     # falls in range [0.125, 0.375].
-    assert all([v > 30 for v in seen])
+    assert np.all([v > 30 for v in seen])
 
     aug = iaa.Crop(percent=(0, (0, 0.1), 0, 0), keep_size=False)
     seen = [0, 0, 0, 0, 0]
@@ -1698,7 +1938,7 @@ def test_Crop():
         observed = aug.augment_image(np.zeros((40, 40), dtype=np.uint8) + 255)
         n_cropped = 40 - observed.shape[1]
         seen[n_cropped] += 1
-    assert all([v > 30 for v in seen])
+    assert np.all([v > 30 for v in seen])
 
     # test crop by list of percentages
     aug = iaa.Crop(percent=([0.0, 0.1], 0, 0, 0), keep_size=False)
@@ -1952,6 +2192,33 @@ def test_PadToFixedSize():
     assert observed.shape == (32, 32, 3)
     assert np.allclose(observed.arr_0to1, expected)
 
+    # basic segmaps test
+    # pad_mode should be ignored for segmaps
+    segmaps = SegmentationMapsOnImage(
+        np.ones((1, 1, 1), dtype=np.int32), shape=(1, 1, 3))
+    aug = iaa.PadToFixedSize(height=3, width=3, pad_mode="edge", position="center")
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    expected = np.int32([
+        [0, 0, 0],
+        [0, 1, 0],
+        [0, 0, 0]
+    ])
+    expected = expected[..., np.newaxis]
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.arr, expected)
+
+    # segmaps with size unequal to image
+    # pad_mode should be ignored for segmaps
+    segmaps = SegmentationMapsOnImage(
+        np.ones((15, 15, 1), dtype=np.int32), shape=(30, 30, 3))
+    aug = iaa.PadToFixedSize(height=32, width=32, pad_mode="edge", position="left-top")
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    expected = np.ones((16, 16, 1), dtype=np.int32)
+    expected[:, 0, 0] = 0
+    expected[0, :, 0] = 0
+    assert observed.shape == (32, 32, 3)
+    assert np.array_equal(observed.arr, expected)
+
     ###################
     # test other dtypes
     ###################
@@ -2162,6 +2429,42 @@ def test_CropToFixedSize():
     assert observed.shape == (32, 32, 3)
     assert np.allclose(observed.arr_0to1, expected)
 
+    # basic segmaps test
+    segmaps = SegmentationMapsOnImage(
+        np.ones((5, 5, 1), dtype=np.int32), shape=(5, 5, 3))
+    aug = iaa.CropToFixedSize(height=3, width=3, position="center")
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    expected = np.ones((3, 3, 1), dtype=np.int32)
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.arr, expected)
+
+    # segmaps, crop at non-center position
+    segmaps = np.arange(5*5).reshape((5, 5, 1)).astype(np.int32)
+    segmaps_oi = SegmentationMapsOnImage(segmaps, shape=(5, 5, 3))
+    aug = iaa.CropToFixedSize(height=3, width=3, position="left-top")
+    observed = aug.augment_segmentation_maps([segmaps_oi])[0]
+    expected = segmaps[2:, 2:, :]
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.arr, expected)
+
+    # segmaps, crop at non-center position
+    heatmaps = np.arange(5*5).reshape((5, 5, 1)).astype(np.int32)
+    segmaps_oi = SegmentationMapsOnImage(heatmaps, shape=(5, 5, 3))
+    aug = iaa.CropToFixedSize(height=3, width=3, position="right-bottom")
+    observed = aug.augment_segmentation_maps([segmaps_oi])[0]
+    expected = segmaps[:3, :3, :]
+    assert observed.shape == (3, 3, 3)
+    assert np.array_equal(observed.arr, expected)
+
+    # segmaps with size unequal to image
+    segmaps = SegmentationMapsOnImage(
+        np.ones((17, 17, 1), dtype=np.int32), shape=(34, 34, 3))
+    aug = iaa.CropToFixedSize(height=32, width=32, position="left-top")
+    observed = aug.augment_segmentation_maps([segmaps])[0]
+    expected = np.ones((16, 16, 1), dtype=np.int32)
+    assert observed.shape == (32, 32, 3)
+    assert np.array_equal(observed.arr, expected)
+
     ###################
     # test other dtypes
     ###################
@@ -2226,32 +2529,47 @@ def test_KeepSizeByResize():
 
     children = iaa.Crop((1, 0, 0, 0), keep_size=False)
 
-    aug = iaa.KeepSizeByResize(children, interpolation="cubic", interpolation_heatmaps="linear")
-    samples, samples_heatmaps = aug._draw_samples(1000, ia.new_random_state(1), True)
-    assert "cubic" in samples
+    aug = iaa.KeepSizeByResize(children,
+                               interpolation="nearest",
+                               interpolation_heatmaps="linear",
+                               interpolation_segmaps="cubic")
+    samples, samples_heatmaps, samples_segmaps = aug._draw_samples(1000, ia.new_random_state(1))
+    assert "nearest" in samples
     assert len(set(samples)) == 1
     assert "linear" in samples_heatmaps
     assert len(set(samples_heatmaps)) == 1
+    assert "cubic" in samples_segmaps
+    assert len(set(samples_segmaps)) == 1
 
-    aug = iaa.KeepSizeByResize(children, interpolation=iaa.KeepSizeByResize.NO_RESIZE,
-                               interpolation_heatmaps=iaa.KeepSizeByResize.SAME_AS_IMAGES)
-    samples, samples_heatmaps = aug._draw_samples(1000, ia.new_random_state(1), True)
+    aug = iaa.KeepSizeByResize(children,
+                               interpolation=iaa.KeepSizeByResize.NO_RESIZE,
+                               interpolation_heatmaps=iaa.KeepSizeByResize.SAME_AS_IMAGES,
+                               interpolation_segmaps=iaa.KeepSizeByResize.SAME_AS_IMAGES)
+    samples, samples_heatmaps, samples_segmaps = aug._draw_samples(1000, ia.new_random_state(1))
     assert iaa.KeepSizeByResize.NO_RESIZE in samples
     assert len(set(samples)) == 1
     assert iaa.KeepSizeByResize.NO_RESIZE in samples_heatmaps
     assert len(set(samples_heatmaps)) == 1
+    assert iaa.KeepSizeByResize.NO_RESIZE in samples_segmaps
+    assert len(set(samples_segmaps)) == 1
 
-    aug = iaa.KeepSizeByResize(children, interpolation=cv2.INTER_LINEAR,
-                               interpolation_heatmaps=cv2.INTER_NEAREST)
-    samples, samples_heatmaps = aug._draw_samples(1000, ia.new_random_state(1), True)
+    aug = iaa.KeepSizeByResize(children,
+                               interpolation=cv2.INTER_LINEAR,
+                               interpolation_heatmaps=cv2.INTER_NEAREST,
+                               interpolation_segmaps=cv2.INTER_CUBIC)
+    samples, samples_heatmaps, samples_segmaps = aug._draw_samples(1000, ia.new_random_state(1))
     assert cv2.INTER_LINEAR in samples
     assert len(set(samples)) == 1
     assert cv2.INTER_NEAREST in samples_heatmaps
     assert len(set(samples_heatmaps)) == 1
+    assert cv2.INTER_CUBIC in samples_segmaps
+    assert len(set(samples_segmaps)) == 1
 
-    aug = iaa.KeepSizeByResize(children, interpolation=["cubic", "nearest"],
-                               interpolation_heatmaps=["linear", iaa.KeepSizeByResize.SAME_AS_IMAGES])
-    samples, samples_heatmaps = aug._draw_samples(5000, ia.new_random_state(1), True)
+    aug = iaa.KeepSizeByResize(children,
+                               interpolation=["cubic", "nearest"],
+                               interpolation_heatmaps=["linear", iaa.KeepSizeByResize.SAME_AS_IMAGES],
+                               interpolation_segmaps=["linear", iaa.KeepSizeByResize.SAME_AS_IMAGES])
+    samples, samples_heatmaps, samples_segmaps = aug._draw_samples(5000, ia.new_random_state(1))
     assert "cubic" in samples
     assert "nearest" in samples
     assert len(set(samples)) == 2
@@ -2259,16 +2577,25 @@ def test_KeepSizeByResize():
     assert "nearest" in samples_heatmaps
     assert len(set(samples_heatmaps)) == 3
     assert 0.5 - 0.1 < np.sum(samples == samples_heatmaps) / samples_heatmaps.size < 0.5 + 0.1
+    assert "linear" in samples_segmaps
+    assert "nearest" in samples_segmaps
+    assert len(set(samples_segmaps)) == 3
+    assert 0.5 - 0.1 < np.sum(samples == samples_segmaps) / samples_segmaps.size < 0.5 + 0.1
 
-    aug = iaa.KeepSizeByResize(children, interpolation=iap.Choice(["cubic", "linear"]),
-                               interpolation_heatmaps=iap.Choice(["linear", "nearest"]))
-    samples, samples_heatmaps = aug._draw_samples(10000, ia.new_random_state(1), True)
+    aug = iaa.KeepSizeByResize(children,
+                               interpolation=iap.Choice(["cubic", "linear"]),
+                               interpolation_heatmaps=iap.Choice(["linear", "nearest"]),
+                               interpolation_segmaps=iap.Choice(["linear", "nearest"]))
+    samples, samples_heatmaps, samples_segmaps = aug._draw_samples(10000, ia.new_random_state(1))
     assert "cubic" in samples
     assert "linear" in samples
     assert len(set(samples)) == 2
     assert "linear" in samples_heatmaps
     assert "nearest" in samples_heatmaps
     assert len(set(samples_heatmaps)) == 2
+    assert "linear" in samples_segmaps
+    assert "nearest" in samples_segmaps
+    assert len(set(samples_segmaps)) == 2
 
     img = np.arange(0, 4*4*3, 1).reshape((4, 4, 3)).astype(np.uint8)
     aug = iaa.KeepSizeByResize(children, interpolation="cubic")
@@ -2311,10 +2638,10 @@ def test_KeepSizeByResize():
 
     # heatmaps
     heatmaps = np.linspace(0.0, 1.0, 4*4*1).reshape((4, 4, 1)).astype(np.float32)
-    heatmaps_oi = ia.HeatmapsOnImage(heatmaps, shape=(4, 4, 1))
-    heatmaps_oi_cubic = ia.HeatmapsOnImage(heatmaps[1:, :, :], shape=(3, 4, 3)).resize((4, 4), interpolation="cubic")
+    heatmaps_oi = HeatmapsOnImage(heatmaps, shape=(4, 4, 1))
+    heatmaps_oi_cubic = HeatmapsOnImage(heatmaps[1:, :, :], shape=(3, 4, 3)).resize((4, 4), interpolation="cubic")
     heatmaps_oi_cubic.shape = (4, 4, 3)
-    heatmaps_oi_nearest = ia.HeatmapsOnImage(heatmaps[1:, :, :], shape=(3, 4, 1)).resize((4, 4), interpolation="nearest")
+    heatmaps_oi_nearest = HeatmapsOnImage(heatmaps[1:, :, :], shape=(3, 4, 1)).resize((4, 4), interpolation="nearest")
     heatmaps_oi_nearest.shape = (4, 4, 3)
 
     aug = iaa.KeepSizeByResize(children, interpolation="cubic", interpolation_heatmaps="nearest")
@@ -2338,6 +2665,28 @@ def test_KeepSizeByResize():
     heatmaps_oi_aug = aug.augment_heatmaps([heatmaps_oi])[0]
     assert heatmaps_oi_aug.arr_0to1.shape == (4, 4, 1)
     assert np.allclose(heatmaps_oi_aug.arr_0to1, heatmaps_oi_cubic.arr_0to1)
+
+    # segmaps
+    segmaps = np.arange(4*4*1).reshape((4, 4, 1)).astype(np.int32)
+    segmaps_oi = SegmentationMapsOnImage(segmaps, shape=(4, 4, 1))
+    segmaps_oi_nearest = SegmentationMapsOnImage(
+        segmaps[1:, :, :], shape=(3, 4, 1)).resize((4, 4), interpolation="nearest")
+    segmaps_oi_nearest.shape = (4, 4, 3)
+
+    aug = iaa.KeepSizeByResize(children, interpolation="cubic")
+    segmaps_oi_aug = aug.augment_segmentation_maps([segmaps_oi])[0]
+    assert segmaps_oi_aug.arr.shape == (4, 4, 1)
+    assert np.array_equal(segmaps_oi_aug.arr, segmaps_oi_nearest.arr)
+
+    aug = iaa.KeepSizeByResize(children, interpolation="cubic", interpolation_segmaps="nearest")
+    segmaps_oi_aug = aug.augment_segmentation_maps([segmaps_oi])[0]
+    assert segmaps_oi_aug.arr.shape == (4, 4, 1)
+    assert np.array_equal(segmaps_oi_aug.arr, segmaps_oi_nearest.arr)
+
+    aug = iaa.KeepSizeByResize(children, interpolation="cubic", interpolation_segmaps=iaa.KeepSizeByResize.NO_RESIZE)
+    segmaps_oi_aug = aug.augment_segmentation_maps([segmaps_oi])[0]
+    assert segmaps_oi_aug.arr.shape == (3, 4, 1)
+    assert np.array_equal(segmaps_oi_aug.arr, segmaps_oi.arr[1:, :, :])
 
 
 if __name__ == "__main__":
